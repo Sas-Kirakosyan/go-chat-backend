@@ -2,6 +2,7 @@ package database
 
 import (
 	"context"
+	"errors"
 	"log"
 	"testing"
 	"time"
@@ -88,6 +89,43 @@ func TestHealth(t *testing.T) {
 
 	if stats["message"] != "It's healthy" {
 		t.Fatalf("expected message to be 'It's healthy', got %s", stats["message"])
+	}
+}
+
+func TestMigrateAndUsers(t *testing.T) {
+	srv := New()
+	ctx := context.Background()
+
+	if err := srv.Migrate(ctx); err != nil {
+		t.Fatalf("Migrate() returned %v", err)
+	}
+	// Migrate must be safe to run against an already-migrated database.
+	if err := srv.Migrate(ctx); err != nil {
+		t.Fatalf("second Migrate() returned %v", err)
+	}
+
+	created, err := srv.CreateUser(ctx, "alice", "hashed-password")
+	if err != nil {
+		t.Fatalf("CreateUser() returned %v", err)
+	}
+	if created.ID == 0 || created.Username != "alice" || created.CreatedAt.IsZero() {
+		t.Fatalf("CreateUser() returned an incomplete user: %+v", created)
+	}
+
+	if _, err := srv.CreateUser(ctx, "alice", "another-hash"); !errors.Is(err, ErrUserExists) {
+		t.Fatalf("duplicate CreateUser() returned %v, want ErrUserExists", err)
+	}
+
+	got, err := srv.GetUserByUsername(ctx, "alice")
+	if err != nil {
+		t.Fatalf("GetUserByUsername() returned %v", err)
+	}
+	if got.ID != created.ID || got.PasswordHash != "hashed-password" {
+		t.Fatalf("GetUserByUsername() = %+v, want %+v", got, created)
+	}
+
+	if _, err := srv.GetUserByUsername(ctx, "nobody"); !errors.Is(err, ErrUserNotFound) {
+		t.Fatalf("GetUserByUsername(missing) returned %v, want ErrUserNotFound", err)
 	}
 }
 

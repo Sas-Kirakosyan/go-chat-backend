@@ -1,32 +1,162 @@
 package server
 
 import (
-	"github.com/gin-gonic/gin"
+	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
+	"sync"
 	"testing"
+
+	"github.com/gin-gonic/gin"
+	"gorm.io/gorm"
+
+	"go-chat-backend/internal/database"
 )
 
-func TestHelloWorldHandler(t *testing.T) {
-	s := &Server{}
-	r := gin.New()
-	r.GET("/", s.HelloWorldHandler)
-	// Create a test HTTP request
-	req, err := http.NewRequest("GET", "/", nil)
-	if err != nil {
-		t.Fatal(err)
+// fakeDB is an in-memory database.Service so the HTTP layer can be tested
+// without a Postgres container. The real store is exercised by the
+// integration tests in internal/database.
+type fakeDB struct {
+	mu      sync.Mutex
+	users   map[string]*database.User
+	nextID  uint
+	healthy bool
+}
+
+func newFakeDB() *fakeDB {
+	return &fakeDB{users: map[string]*database.User{}, healthy: true}
+}
+
+func (f *fakeDB) Health() map[string]string {
+	if !f.healthy {
+		return map[string]string{"status": "down", "error": "db down"}
 	}
-	// Create a ResponseRecorder to record the response
+	return map[string]string{"status": "up", "message": "It's healthy"}
+}
+
+func (f *fakeDB) Migrate(context.Context) error { return nil }
+
+func (f *fakeDB) CreateUser(_ context.Context, username, passwordHash string) (*database.User, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if _, ok := f.users[username]; ok {
+		return nil, database.ErrUserExists
+	}
+	f.nextID++
+	u := &database.User{
+		Model:        gorm.Model{ID: f.nextID},
+		Username:     username,
+		PasswordHash: passwordHash,
+	}
+	f.users[username] = u
+	return u, nil
+}
+
+func (f *fakeDB) GetUserByUsername(_ context.Context, username string) (*database.User, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	u, ok := f.users[username]
+	if !ok {
+		return nil, database.ErrUserNotFound
+	}
+	return u, nil
+}
+
+func (f *fakeDB) Close() error { return nil }
+
+func newTestServer(t *testing.T) (*Server, *gin.Engine, *fakeDB) {
+	t.Helper()
+	gin.SetMode(gin.TestMode)
+	db := newFakeDB()
+	s := &Server{port: 8080, db: db, jwtKey: []byte("test-secret")}
+	return s, s.RegisterRoutes(), db
+}
+
+func do(t *testing.T, r *gin.Engine, method, path, body, authHeader string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(method, path, strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	if authHeader != "" {
+		req.Header.Set("Authorization", authHeader)
+	}
 	rr := httptest.NewRecorder()
-	// Serve the HTTP request
 	r.ServeHTTP(rr, req)
-	// Check the status code
-	if status := rr.Code; status != http.StatusOK {
-		t.Errorf("Handler returned wrong status code: got %v want %v", status, http.StatusOK)
+	return rr
+}
+
+func TestRegisterLoginProfileFlow(t *testing.T) {
+	_, r, _ := newTestServer(t)
+	const creds = `{"username":"alice","password":"correct-horse"}`
+
+	if rr := do(t, r, "POST", "/register", creds, ""); rr.Code != http.StatusCreated {
+		t.Fatalf("register: got %d, want %d (body %s)", rr.Code, http.StatusCreated, rr.Body)
 	}
-	// Check the response body
-	expected := "{\"message\":\"Hello World\"}"
-	if rr.Body.String() != expected {
-		t.Errorf("Handler returned unexpected body: got %v want %v", rr.Body.String(), expected)
+
+	rr := do(t, r, "POST", "/login", creds, "")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("login: got %d, want %d (body %s)", rr.Code, http.StatusOK, rr.Body)
+	}
+	var resp struct {
+		Token string `json:"token"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode login response: %v", err)
+	}
+	if resp.Token == "" {
+		t.Fatal("login returned an empty token")
+	}
+
+	rr = do(t, r, "GET", "/auth/profile", "", "Bearer "+resp.Token)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("profile: got %d, want %d (body %s)", rr.Code, http.StatusOK, rr.Body)
+	}
+	if !strings.Contains(rr.Body.String(), `"alice"`) {
+		t.Fatalf("profile: expected username in body, got %s", rr.Body)
+	}
+}
+
+func TestRegisterRejectsDuplicateUsername(t *testing.T) {
+	_, r, _ := newTestServer(t)
+	const creds = `{"username":"bob","password":"correct-horse"}`
+
+	do(t, r, "POST", "/register", creds, "")
+	if rr := do(t, r, "POST", "/register", creds, ""); rr.Code != http.StatusConflict {
+		t.Fatalf("duplicate register: got %d, want %d", rr.Code, http.StatusConflict)
+	}
+}
+
+func TestRegisterRejectsShortPassword(t *testing.T) {
+	_, r, _ := newTestServer(t)
+	rr := do(t, r, "POST", "/register", `{"username":"carol","password":"short"}`, "")
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("got %d, want %d", rr.Code, http.StatusBadRequest)
+	}
+}
+
+func TestLoginRejectsBadCredentials(t *testing.T) {
+	_, r, _ := newTestServer(t)
+	do(t, r, "POST", "/register", `{"username":"dave","password":"correct-horse"}`, "")
+
+	cases := map[string]string{
+		"wrong password": `{"username":"dave","password":"wrong-horse"}`,
+		"unknown user":   `{"username":"nobody","password":"correct-horse"}`,
+	}
+	for name, body := range cases {
+		t.Run(name, func(t *testing.T) {
+			if rr := do(t, r, "POST", "/login", body, ""); rr.Code != http.StatusUnauthorized {
+				t.Fatalf("got %d, want %d", rr.Code, http.StatusUnauthorized)
+			}
+		})
+	}
+}
+
+func TestHealthHandlerReportsDownDatabase(t *testing.T) {
+	_, r, db := newTestServer(t)
+	db.healthy = false
+
+	if rr := do(t, r, "GET", "/health", "", ""); rr.Code != http.StatusServiceUnavailable {
+		t.Fatalf("got %d, want %d", rr.Code, http.StatusServiceUnavailable)
 	}
 }

@@ -25,10 +25,18 @@ func mustStartPostgresContainer() (func(context.Context, ...testcontainers.Termi
 		postgres.WithDatabase(dbName),
 		postgres.WithUsername(dbUser),
 		postgres.WithPassword(dbPwd),
+		// The official Postgres image logs "ready to accept connections" twice:
+		// once for the temporary server initdb uses to create the database, and
+		// again for the real one. Waiting for the second occurrence is what keeps
+		// us from connecting to the throwaway server.
+		//
+		// The timeout is a ceiling, not a delay — the wait returns the moment the
+		// second line appears. It has to cover initdb on a cold start, which is
+		// far more than five seconds under the WSL2 backend.
 		testcontainers.WithWaitStrategy(
 			wait.ForLog("database system is ready to accept connections").
 				WithOccurrence(2).
-				WithStartupTimeout(5*time.Second)),
+				WithStartupTimeout(60*time.Second)),
 	)
 	if err != nil {
 		return nil, err
@@ -37,6 +45,13 @@ func mustStartPostgresContainer() (func(context.Context, ...testcontainers.Termi
 	database = dbName
 	password = dbPwd
 	username = dbUser
+
+	// godotenv's autoload resolves .env against the working directory, which
+	// under `go test` is this package's folder rather than the project root.
+	// Nothing is loaded here, so every value the connection string needs has to
+	// be set explicitly — including the schema, which would otherwise be empty
+	// and make AutoMigrate fail with "no schema has been selected to create in".
+	schema = "public"
 
 	dbHost, err := dbContainer.Host(context.Background())
 	if err != nil {

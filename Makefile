@@ -12,6 +12,10 @@ build:
 # Run the application
 run:
 	@go run cmd/api/main.go
+# Seed the database with test users (override with e.g. `make seed ARGS="-n 20"`)
+seed:
+	@go run cmd/seed/main.go $(ARGS)
+
 # Create DB container
 docker-run:
 	@docker compose up --build
@@ -46,4 +50,4 @@ watch:
 		Write-Output 'Watching...'; \
 	}"
 
-.PHONY: all build run test clean watch docker-run docker-down itest
+.PHONY: all build run seed test clean watch docker-run docker-down itest

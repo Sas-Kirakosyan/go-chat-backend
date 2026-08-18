@@ -31,7 +31,7 @@ test:
 # Integrations Tests for the application
 itest:
 	@echo "Running integration tests..."
-	@go test ./internal/database -v
+	@go test ./internal/database -v -count=1
 
 # Clean the binary
 clean:

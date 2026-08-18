@@ -1,0 +1,21 @@
+# Everything here is excluded from the build context, which means it can never
+# end up inside an image layer. Secrets are the important case: an image is
+# routinely pushed to a registry, and a file baked into a layer stays readable
+# there even if a later layer deletes it.
+.env
+*.env
+
+.git
+.gitignore
+
+# Built on the host for a different OS; the image builds its own.
+main
+main.exe
+tmp/
+
+Dockerfile
+.dockerignore
+docker-compose.yml
+README.md
+CLAUDE.md
+.air.toml

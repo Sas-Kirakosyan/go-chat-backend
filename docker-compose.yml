@@ -1,15 +1,54 @@
 services:
   psql_bp:
-    image: postgres:latest
+    image: postgres:18
     restart: unless-stopped
     environment:
       POSTGRES_DB: ${BLUEPRINT_DB_DATABASE}
       POSTGRES_USER: ${BLUEPRINT_DB_USERNAME}
       POSTGRES_PASSWORD: ${BLUEPRINT_DB_PASSWORD}
     ports:
-      - "${BLUEPRINT_DB_PORT}:5432"
+      # Host 5433, not 5432: the PostgreSQL 17 installed natively on this
+      # machine already holds 5432, and two processes cannot bind one port.
+      # Inside the compose network the container is still reached on 5432.
+      - "5433:5432"
     volumes:
-      - psql_volume_bp:/var/lib/postgresql/data
+      # Postgres 18 moved the data dir convention: the mount belongs at
+      # /var/lib/postgresql, and PGDATA becomes a versioned subdirectory of it.
+      # Mounting the old /var/lib/postgresql/data makes 18 ignore the volume
+      # and refuse to start.
+      - psql_volume_bp:/var/lib/postgresql
+    healthcheck:
+      # "Container started" is not "database accepting queries". Postgres runs
+      # its init sequence first, and the api below waits on this check rather
+      # than on the container merely existing.
+      test: ["CMD-SHELL", "pg_isready -U ${BLUEPRINT_DB_USERNAME} -d ${BLUEPRINT_DB_DATABASE}"]
+      interval: 3s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+
+  api:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      psql_bp:
+        condition: service_healthy
+    environment:
+      PORT: 8080
+      APP_ENV: production
+      JWT_SECRET: ${JWT_SECRET}
+      # Compose gives every service a DNS name on the shared network, so the
+      # host here is the service name rather than localhost. Inside the
+      # network Postgres is on its real port, 5432, not the 5433 published
+      # to the host.
+      BLUEPRINT_DB_HOST: psql_bp
+      BLUEPRINT_DB_PORT: 5432
+      BLUEPRINT_DB_DATABASE: ${BLUEPRINT_DB_DATABASE}
+      BLUEPRINT_DB_USERNAME: ${BLUEPRINT_DB_USERNAME}
+      BLUEPRINT_DB_PASSWORD: ${BLUEPRINT_DB_PASSWORD}
+      BLUEPRINT_DB_SCHEMA: ${BLUEPRINT_DB_SCHEMA}
+    ports:
+      - "8080:8080"
 
 volumes:
   psql_volume_bp:

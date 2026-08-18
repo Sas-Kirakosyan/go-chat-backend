@@ -32,3 +32,6 @@ main
 # OS X generated file
 .DS_Store
 
+
+# Claude Code notes (local only)
+CLAUDE.md

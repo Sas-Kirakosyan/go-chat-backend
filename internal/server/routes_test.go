@@ -33,6 +33,11 @@ type fakeDB struct {
 	nextConvID    uint
 	nextMemberID  uint
 	nextMsgID     uint
+
+	// Login sessions, keyed by the hex of the token hash because a []byte
+	// cannot be a map key. The methods live in refresh_test.go.
+	sessions      map[string]*database.RefreshToken
+	nextSessionID uint
 }
 
 func newFakeDB() *fakeDB {
@@ -41,6 +46,7 @@ func newFakeDB() *fakeDB {
 		usersByID:     map[uint]*database.User{},
 		conversations: map[uint]*database.Conversation{},
 		memberIDs:     map[uint][]uint{},
+		sessions:      map[string]*database.RefreshToken{},
 		healthy:       true,
 	}
 }

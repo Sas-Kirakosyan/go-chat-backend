@@ -150,4 +150,11 @@ func TestClose(t *testing.T) {
 	if srv.Close() != nil {
 		t.Fatalf("expected Close() to return nil")
 	}
+
+	// New() caches one connection pool in dbInstance and hands the same one to
+	// every caller, so closing it leaves that cached pool dead. Any test that
+	// runs after this one would then fail with "sql: database is closed", and
+	// which tests those are depends only on file names. Clearing the cache
+	// makes the next New() open a fresh pool, so the order stops mattering.
+	dbInstance = nil
 }

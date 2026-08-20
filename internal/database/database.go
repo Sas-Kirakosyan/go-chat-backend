@@ -30,6 +30,12 @@ var ErrConversationNotFound = errors.New("conversation not found")
 // ErrAlreadyMember is returned by AddMember when the user is already in the room.
 var ErrAlreadyMember = errors.New("user is already a member")
 
+// ErrRefreshTokenNotFound is returned by GetValidRefreshToken for a session
+// that does not exist, one that was logged out, and one that has expired. The
+// three are deliberately the same error: the caller answers 401 either way,
+// and telling them apart would let someone probe which tokens once existed.
+var ErrRefreshTokenNotFound = errors.New("refresh token not found")
+
 // Service represents a service that interacts with a database.
 type Service interface {
 	// Health returns a map of health status information.
@@ -51,6 +57,24 @@ type Service interface {
 	// GetUserByID looks a user up by id. It returns ErrUserNotFound if there
 	// is no such user.
 	GetUserByID(ctx context.Context, id uint) (*User, error)
+
+	// CreateRefreshToken opens a login session for a user. tokenHash is the
+	// SHA-256 of the token handed to the client; the token itself is never
+	// stored.
+	CreateRefreshToken(ctx context.Context, userID uint, tokenHash []byte, expiresAt time.Time) (*RefreshToken, error)
+
+	// GetValidRefreshToken looks up a live session by its token hash, with the
+	// user loaded. It returns ErrRefreshTokenNotFound when the session does
+	// not exist, was revoked, or has expired.
+	GetValidRefreshToken(ctx context.Context, tokenHash []byte) (*RefreshToken, error)
+
+	// RevokeRefreshToken ends one session. It is not an error to revoke a
+	// session that is already gone: logging out twice is not a failure.
+	RevokeRefreshToken(ctx context.Context, tokenHash []byte) error
+
+	// PurgeExpiredRefreshTokens deletes a user's dead sessions. It runs at
+	// login, so the table stays bounded without a background job.
+	PurgeExpiredRefreshTokens(ctx context.Context, userID uint) error
 
 	// CreateConversation makes a room and puts the creator inside it, together
 	// with everyone in memberIDs. It returns ErrUserNotFound if any of those

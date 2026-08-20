@@ -178,7 +178,9 @@ func TestMigrateIsVersionedAndRepeatable(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetDBVersion() returned %v", err)
 	}
-	if want := int64(2); version != want {
+	// Bump this when a migration is added. It is a deliberate speed bump: a
+	// new .sql file should be a conscious act, not something that slips in.
+	if want := int64(3); version != want {
 		t.Fatalf("database is at version %d, want %d", version, want)
 	}
 

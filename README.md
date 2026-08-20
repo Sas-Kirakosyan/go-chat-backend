@@ -8,8 +8,8 @@ CORS is configured for a frontend on `http://localhost:5173`.
 
 ## Status
 
-Authentication and the conversation REST API are implemented and tested. The
-WebSocket delivery layer is not built yet.
+Authentication with refresh-token sessions, and the conversation REST API, are
+implemented and tested. The WebSocket delivery layer is not built yet.
 
 ## Endpoints
 
@@ -17,7 +17,9 @@ WebSocket delivery layer is not built yet.
 | ------ | ----------------------------- | ------ | ------------------------------------------- |
 | `GET`  | `/health`                     | no     | Database connectivity and pool stats        |
 | `POST` | `/register`                   | no     | Create an account                           |
-| `POST` | `/login`                      | no     | Exchange credentials for a JWT              |
+| `POST` | `/login`                      | no     | Exchange credentials for a JWT + session    |
+| `POST` | `/auth/refresh`               | cookie | A new access token, without logging in      |
+| `POST` | `/auth/logout`                | cookie | End the session                             |
 | `GET`  | `/auth/profile`               | bearer | The current user                            |
 | `POST` | `/conversations`              | bearer | Create a room                               |
 | `GET`  | `/conversations`              | bearer | Rooms I am a member of                      |
@@ -28,6 +30,66 @@ WebSocket delivery layer is not built yet.
 Tokens are HS256, valid for 15 minutes, and sent as `Authorization: Bearer <token>`.
 The token carries the user id as well as the name, so a room handler does not
 need an extra `SELECT` to find out who is calling.
+
+## Sessions
+
+A login gives you two things with two different jobs:
+
+| | Access token | Refresh token |
+| --- | --- | --- |
+| What it is | HS256 JWT | 32 random bytes, base64 |
+| Lives for | 15 minutes | 7 days |
+| Sent as | `Authorization: Bearer` | httpOnly cookie, path `/auth` |
+| Checked against the database | never | on every use |
+| Job | prove who you are | get a new access token |
+
+The client keeps working while the access token is alive, calls
+`POST /auth/refresh` when it expires, and only sees a login screen after seven
+idle days.
+
+### Why not just a 24-hour access token?
+
+Because the access token is never looked up, it cannot be taken back. Stretching
+it to 24 hours would make a stolen token useful for a day and would still leave
+no way to log anyone out. The refresh token is a **row in a table**, so ending a
+session is a single `UPDATE` — and that is what makes logout mean something.
+
+### The cookie
+
+`httpOnly`, so page JavaScript cannot read it: an XSS bug cannot walk off with a
+week-long login. `SameSite=Lax` is enough because `:5173` and `:8080` are the
+same site — a port is not part of a site — while a genuine cross-site request
+still gets no cookie. `Secure` is switched off only when `APP_ENV=local`, since
+a browser refuses a `Secure` cookie over plain http.
+
+The path is `/auth`, not `/`, so the browser never attaches a week-long
+credential to a message send or a history read.
+
+### Only the hash is stored
+
+The database keeps the SHA-256 of the token, never the token itself, so a
+leaked backup hands an attacker nothing usable. bcrypt is deliberately not used
+here: it is slow by design to make guessing a human password expensive, and this
+input is 256 bits of randomness with nothing to guess — the slowness would only
+tax every refresh.
+
+### Two trade-offs worth knowing
+
+**The refresh token does not rotate.** A refresh returns a new access token and
+leaves the cookie alone. Two browser tabs can therefore refresh at the same
+moment without one invalidating the other. The cost is that a stolen refresh
+token stays useful for its whole life, and nothing detects the theft. Seven days
+rather than the more common thirty is the counterweight to that choice.
+
+**Logout is not instant.** Ending the session stops any *new* access token being
+minted, but the one the caller already holds keeps working until it expires — at
+most 15 more minutes. Closing that gap would mean checking a revocation list on
+every single request, which puts a database lookup on the busiest path in the
+app. The 15-minute window is the price of a stateless access token.
+
+Sessions are per login, not per user, so logging out on your phone leaves your
+laptop signed in. Dead rows are cleared at the next login by that user, which
+keeps the table bounded without a background job.
 
 ## Design decisions
 

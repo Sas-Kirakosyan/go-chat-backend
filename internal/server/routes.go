@@ -34,6 +34,19 @@ func (s *Server) RegisterRoutes() *gin.Engine {
 	r.POST("/register", s.RegisterHandler)
 	r.POST("/login", s.LoginHandler)
 
+	// Two groups share the /auth prefix on purpose, because they are guarded
+	// by two different things.
+	//
+	// These two authenticate with the refresh cookie, not with the access
+	// token, so they must NOT sit behind AuthMiddleware: refresh is called
+	// exactly when the access token has expired, and requiring a valid one
+	// would make it useless.
+	session := r.Group("/auth")
+	{
+		session.POST("/refresh", s.RefreshHandler)
+		session.POST("/logout", s.LogoutHandler)
+	}
+
 	auth := r.Group("/auth")
 	auth.Use(s.AuthMiddleware())
 	auth.GET("/profile", func(c *gin.Context) {

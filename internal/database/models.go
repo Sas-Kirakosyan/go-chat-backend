@@ -28,6 +28,30 @@ type User struct {
 	Memberships []ConversationMember
 }
 
+// RefreshToken is one login session.
+//
+// It does not embed gorm.Model: a soft-deleted session is a contradiction, and
+// the unique index on token_hash does not know about soft deletes anyway.
+// Ending a session sets RevokedAt instead.
+type RefreshToken struct {
+	ID     uint `gorm:"primarykey"`
+	UserID uint
+
+	// TokenHash is the SHA-256 of the token that was handed to the client.
+	// The token itself is never stored anywhere on the server.
+	TokenHash []byte
+
+	ExpiresAt time.Time
+	CreatedAt time.Time
+
+	// RevokedAt is nil while the session is live, and set when the user logs
+	// out. A session is usable only when it is neither revoked nor expired.
+	RevokedAt *time.Time
+
+	// User is a belongs-to association, populated with .Preload("User").
+	User User `gorm:"foreignKey:UserID"`
+}
+
 // Conversation is one chat room. The room itself owns no user: who is inside
 // lives in ConversationMember, so a room can hold two people or twenty.
 // CreatedByID is kept for audit only — it grants no extra rights.

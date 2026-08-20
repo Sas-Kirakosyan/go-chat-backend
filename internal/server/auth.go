@@ -92,24 +92,35 @@ func (s *Server) LoginHandler(c *gin.Context) {
 		return
 	}
 
-	claims := &Claims{
-		UserID:   user.ID,
-		Username: user.Username,
-		RegisteredClaims: jwt.RegisteredClaims{
-			Subject:   user.Username,
-			IssuedAt:  jwt.NewNumericDate(time.Now()),
-			ExpiresAt: jwt.NewNumericDate(time.Now().Add(tokenTTL)),
-		},
-	}
-
-	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
-	tokenString, err := token.SignedString(s.jwtKey)
+	tokenString, err := s.signAccessToken(user.ID, user.Username)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Could not issue token"})
 		return
 	}
 
-	c.JSON(http.StatusOK, gin.H{"token": tokenString})
+	// The long-lived half of the login. It goes back as an httpOnly cookie, so
+	// the page's JavaScript never touches it.
+	if err := s.issueRefreshSession(c, user.ID); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Could not start session"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"token": tokenString, "expires_in": int(tokenTTL.Seconds())})
+}
+
+// signAccessToken mints the short-lived JWT. Login and refresh both need one,
+// and they must mint it the same way.
+func (s *Server) signAccessToken(userID uint, username string) (string, error) {
+	claims := &Claims{
+		UserID:   userID,
+		Username: username,
+		RegisteredClaims: jwt.RegisteredClaims{
+			Subject:   username,
+			IssuedAt:  jwt.NewNumericDate(time.Now()),
+			ExpiresAt: jwt.NewNumericDate(time.Now().Add(tokenTTL)),
+		},
+	}
+	return jwt.NewWithClaims(jwt.SigningMethodHS256, claims).SignedString(s.jwtKey)
 }
 
 func (s *Server) AuthMiddleware() gin.HandlerFunc {

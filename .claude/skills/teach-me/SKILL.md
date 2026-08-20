@@ -1,6 +1,7 @@
 ---
 name: teach-me
-description: Run a hands-on learning session about this chat backend. The user runs the HTTP requests themselves (curl or Postman), predicts each result before running it, then answers interview questions out loud about the design choices. Use when the user says "teach me", "quiz me", "drill me", "test my understanding", "interview practice", "explain what we built", or asks to prepare to talk about this project. This skill teaches; it does not write feature code.
+description: Hands-on learning session about this chat backend (lab, review, interview drill). Manual only — the user starts it with /teach-me.
+disable-model-invocation: true
 ---
 
 # Teach me

@@ -8,20 +8,88 @@ CORS is configured for a frontend on `http://localhost:5173`.
 
 ## Status
 
-Authentication is implemented and tested. The conversation and message tables
-are defined and migrated, but the endpoints that read and write them are not
-built yet.
+Authentication and the conversation REST API are implemented and tested. The
+WebSocket delivery layer is not built yet.
 
 ## Endpoints
 
-| Method | Path             | Auth   | Description                          |
-| ------ | ---------------- | ------ | ------------------------------------ |
-| `GET`  | `/health`        | no     | Database connectivity and pool stats |
-| `POST` | `/register`      | no     | Create an account                    |
-| `POST` | `/login`         | no     | Exchange credentials for a JWT       |
-| `GET`  | `/auth/profile`  | bearer | The current user                     |
+| Method | Path                          | Auth   | Description                                 |
+| ------ | ----------------------------- | ------ | ------------------------------------------- |
+| `GET`  | `/health`                     | no     | Database connectivity and pool stats        |
+| `POST` | `/register`                   | no     | Create an account                           |
+| `POST` | `/login`                      | no     | Exchange credentials for a JWT              |
+| `GET`  | `/auth/profile`               | bearer | The current user                            |
+| `POST` | `/conversations`              | bearer | Create a room                               |
+| `GET`  | `/conversations`              | bearer | Rooms I am a member of                      |
+| `POST` | `/conversations/:id/members`  | bearer | Add someone to a room                       |
+| `POST` | `/conversations/:id/messages` | bearer | Send a message                              |
+| `GET`  | `/conversations/:id/messages` | bearer | History, newest first, keyset paginated     |
 
 Tokens are HS256, valid for 15 minutes, and sent as `Authorization: Bearer <token>`.
+The token carries the user id as well as the name, so a room handler does not
+need an extra `SELECT` to find out who is calling.
+
+## Design decisions
+
+**Writes go over REST. The WebSocket is delivery-only.**
+
+Every message is created by `POST /conversations/:id/messages` and nowhere
+else. When the hub arrives it will only push out rows this endpoint already
+stored.
+
+One write path means one place for validation, persistence and idempotency, and
+it leaves the hub as a pure fan-out with no database of its own. Accepting
+writes over the socket as well would mean two code paths that must stay in step
+forever — two validators, two ways to fail halfway, two things to fix when a
+rule changes — and it buys nothing, because a client that can open a socket can
+also send a POST.
+
+**Rooms live at `/conversations`, not `/auth/conversations`.**
+
+Auth is the mechanism that guards a room, not the thing a room belongs to. The
+routes use the same middleware in a separate route group.
+
+**A room you are not in returns 404, not 403.**
+
+403 confirms the room is real. Repeated over a range of ids, that lets an
+outsider map which rooms exist. A missing room, a malformed id and a real room
+the caller is not in all answer the same way. The check lives in one helper,
+`memberOnly`, which every room handler calls first.
+
+**Wire types are separate from the GORM models.**
+
+The models carry `DeletedAt`, a password hash and association slices that must
+never reach a client, and renaming a column must not silently change the public
+API. The `*DTO` types in `internal/server/conversations.go` are the contract.
+
+### Membership and messages
+
+A room owns no user of its own. Membership lives in `conversation_members`,
+with a unique index on `(conversation_id, user_id)`, so a room holds any number
+of people. `created_by_id` is kept for audit only — it grants no extra rights,
+and any member may add anyone else.
+
+### Paging history
+
+`GET /conversations/:id/messages` returns messages newest first.
+
+- `?before_id=` returns only messages older than that id.
+- `?limit=` defaults to 50 and is capped at 100 rather than refused.
+- The response carries `next_before_id`: the cursor for the next, older page,
+  or `null` at the start of the room.
+
+Paging on the id instead of `OFFSET` keeps the pages stable. `OFFSET` has to
+count and discard every earlier row, and a message written between two requests
+shifts the whole window, so the reader sees a line twice or misses it.
+
+### Idempotent sends
+
+`POST /conversations/:id/messages` accepts an optional `client_msg_id`. Sending
+the same one again returns the first message with `200` instead of writing a
+second one with `201`, so a retry after a network timeout cannot double-post.
+The unique index covers `(conversation_id, sender_id, client_msg_id)`, so the
+key only has to be unique per sender and two clients picking the same string
+never collide.
 
 ## Configuration
 
@@ -43,14 +111,87 @@ BLUEPRINT_DB_SCHEMA=public
 `JWT_SECRET` is required — the server refuses to start without it. Setting
 `APP_ENV=local` echoes every SQL statement to the log.
 
-Tables are created automatically on startup via GORM's `AutoMigrate`.
+## Migrations
+
+The schema lives in [`internal/database/migrations`](internal/database/migrations)
+as plain `.sql` files, run by [goose](https://github.com/pressly/goose). The
+server applies anything pending when it starts, so a fresh clone plus a running
+Postgres is all you need.
+
+The files are embedded into the binary with `//go:embed`, so a built server
+carries its own schema and needs no extra files beside it.
+
+| Command | What it does |
+| ------- | ------------ |
+| `make migrate-status` | which migrations have run, which are pending |
+| `make migrate-up` | apply everything pending |
+| `make migrate-down` | undo the newest migration, one step |
+| `make migration NAME=add_read_receipts` | scaffold a new pair of Up/Down files |
+
+`migrate-down` is one step on purpose. A down migration can drop a column and
+lose the data in it, so it should be a decision each time, not one command that
+walks the database back to nothing.
+
+Two servers starting together take a Postgres advisory lock first, so only one
+of them applies a migration.
+
+### Why not GORM's AutoMigrate?
+
+This project used `AutoMigrate` before. It reads the Go structs and adds
+whatever the database is missing. That is convenient and it is not enough:
+
+- It only ever **adds**. It cannot drop a column, so the dead `conversations.user_id`
+  and `messages.role` had to be removed by hand.
+- It cannot **move data**. Renaming a column gives you a new empty one and
+  leaves the old values behind, silently.
+- It keeps **no history**. There is no record of what ran, so it re-guesses the
+  whole schema on every start and you cannot read the SQL before it runs.
+- There is **no way back**. No rollback, no down step.
+
+The migration that introduced rooms shows the difference:
+[`00002_rooms_and_members.sql`](internal/database/migrations/00002_rooms_and_members.sql)
+carries each old conversation's single owner into `created_by_id` *and* inserts
+that person into `conversation_members`, so nobody loses a room they already
+had. `AutoMigrate` could never have done that.
+
+The same file adds `messages.sender_id` as `NOT NULL` with no default. On a
+table that already holds messages Postgres refuses and the whole migration
+rolls back. That is deliberate: the old `role` column cannot tell us who wrote
+an old message, and refusing is better than inventing a sender.
+
+The GORM structs in [`models.go`](internal/database/models.go) no longer carry
+`size`, `index` or `not null` tags. Those only ever fed `AutoMigrate`. The SQL
+files are the one source of truth for the schema now; the structs only say how
+rows are read and written.
+
+### Adopting goose on a database you already have
+
+`00001_init.sql` is the baseline. It is the schema exactly as `AutoMigrate`
+built it, and it is the one file that uses `IF NOT EXISTS`, so a database made
+by the old code adopts goose without being rebuilt and keeps its rows. Every
+migration after it is plain, exact SQL.
 
 ## Getting started
 
 ```bash
 make docker-run   # start Postgres
-make run          # start the API
+make run          # start the API — it applies any pending migrations first
 ```
+
+If you are coming from an older checkout, `make run` is enough: goose adopts the
+existing tables and brings them up to date. `make migrate-status` shows you what
+it will do before you run it.
+
+The `api` service in `docker-compose.yml` ships the same binary. It migrates on
+startup too, so after pulling schema changes rebuild it rather than only
+restarting it:
+
+```bash
+docker compose up --build -d
+```
+
+A stale container is worth avoiding: it still holds the old code, and old code
+migrates the database its old way.
 
 ## MakeFile
 
@@ -96,6 +237,14 @@ make test
 Clean up binary from the last build:
 ```bash
 make clean
+```
+
+Migrations (see [Migrations](#migrations) above):
+```bash
+make migrate-status
+make migrate-up
+make migrate-down
+make migration NAME=add_read_receipts
 ```
 
 The database tests use [testcontainers](https://testcontainers.com/) and need a

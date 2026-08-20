@@ -14,6 +14,8 @@ import (
 	"go-chat-backend/internal/database"
 )
 
+//this file contains the authentication logic, including token validation and user identification
+
 const tokenTTL = 15 * time.Minute
 
 // dummyHash is compared against when the username does not exist, so that a
@@ -32,7 +34,12 @@ type Credentials struct {
 	Password string `json:"password" binding:"required,min=8,max=72"`
 }
 
+// Claims carries the user id as well as the name. Every conversation handler
+// needs the id, and reading it from the signed token saves a SELECT on each
+// request. The token is already trusted at that point: the signature check has
+// passed, so the id inside it is one the server put there at login.
 type Claims struct {
+	UserID   uint   `json:"user_id"`
 	Username string `json:"username"`
 	jwt.RegisteredClaims
 }
@@ -86,6 +93,7 @@ func (s *Server) LoginHandler(c *gin.Context) {
 	}
 
 	claims := &Claims{
+		UserID:   user.ID,
 		Username: user.Username,
 		RegisteredClaims: jwt.RegisteredClaims{
 			Subject:   user.Username,
@@ -122,9 +130,23 @@ func (s *Server) AuthMiddleware() gin.HandlerFunc {
 			return
 		}
 
+		c.Set("userID", claims.UserID)
 		c.Set("username", claims.Username)
 		c.Next()
 	}
+}
+
+// currentUser reads the caller's identity, which AuthMiddleware put on the
+// context after the token check. Handlers behind that middleware can rely on
+// both values being there.
+func currentUser(c *gin.Context) (id uint, username string) {
+	if v, ok := c.Get("userID"); ok {
+		id, _ = v.(uint)
+	}
+	if v, ok := c.Get("username"); ok {
+		username, _ = v.(string)
+	}
+	return id, username
 }
 
 // bearerToken pulls the token out of an "Authorization: Bearer <token>" header.

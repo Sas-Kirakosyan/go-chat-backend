@@ -7,6 +7,8 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
+//which URL goes to which function
+
 func (s *Server) healthHandler(c *gin.Context) {
 	stats := s.db.Health()
 	if stats["status"] != "up" {
@@ -35,9 +37,27 @@ func (s *Server) RegisterRoutes() *gin.Engine {
 	auth := r.Group("/auth")
 	auth.Use(s.AuthMiddleware())
 	auth.GET("/profile", func(c *gin.Context) {
-		username, _ := c.Get("username")
-		c.JSON(200, gin.H{"user": username})
+		id, username := currentUser(c)
+		c.JSON(http.StatusOK, gin.H{"id": id, "user": username})
 	})
+
+	// Rooms live under /conversations, not under /auth. Auth is the mechanism
+	// that guards them, not the thing they belong to, so it is the same
+	// middleware on a separate group.
+	//
+	// Every write goes through these routes. When the WebSocket arrives it
+	// will only push out what was already stored here, so validation,
+	// persistence and the idempotency key stay in one place and the hub stays
+	// a plain fan-out.
+	conversations := r.Group("/conversations")
+	conversations.Use(s.AuthMiddleware())
+	{
+		conversations.POST("", s.CreateConversationHandler)
+		conversations.GET("", s.ListConversationsHandler)
+		conversations.POST("/:id/members", s.AddMemberHandler)
+		conversations.POST("/:id/messages", s.SendMessageHandler)
+		conversations.GET("/:id/messages", s.ListMessagesHandler)
+	}
 
 	return r
 }

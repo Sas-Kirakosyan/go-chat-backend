@@ -19,14 +19,30 @@ import (
 // without a Postgres container. The real store is exercised by the
 // integration tests in internal/database.
 type fakeDB struct {
-	mu      sync.Mutex
-	users   map[string]*database.User
-	nextID  uint
-	healthy bool
+	mu        sync.Mutex
+	users     map[string]*database.User
+	usersByID map[uint]*database.User
+	nextID    uint
+	healthy   bool
+
+	// Rooms and their message log. memberIDs holds each room's members in the
+	// order they joined; the store methods live in conversations_test.go.
+	conversations map[uint]*database.Conversation
+	memberIDs     map[uint][]uint
+	messages      []database.Message
+	nextConvID    uint
+	nextMemberID  uint
+	nextMsgID     uint
 }
 
 func newFakeDB() *fakeDB {
-	return &fakeDB{users: map[string]*database.User{}, healthy: true}
+	return &fakeDB{
+		users:         map[string]*database.User{},
+		usersByID:     map[uint]*database.User{},
+		conversations: map[uint]*database.Conversation{},
+		memberIDs:     map[uint][]uint{},
+		healthy:       true,
+	}
 }
 
 func (f *fakeDB) Health() map[string]string {
@@ -51,6 +67,7 @@ func (f *fakeDB) CreateUser(_ context.Context, username, passwordHash string) (*
 		PasswordHash: passwordHash,
 	}
 	f.users[username] = u
+	f.usersByID[u.ID] = u
 	return u, nil
 }
 

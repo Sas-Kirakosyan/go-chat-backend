@@ -50,7 +50,7 @@ func mustStartPostgresContainer() (func(context.Context, ...testcontainers.Termi
 	// under `go test` is this package's folder rather than the project root.
 	// Nothing is loaded here, so every value the connection string needs has to
 	// be set explicitly — including the schema, which would otherwise be empty
-	// and make AutoMigrate fail with "no schema has been selected to create in".
+	// and make the migrations fail with "no schema has been selected to create in".
 	schema = "public"
 
 	dbHost, err := dbContainer.Host(context.Background())

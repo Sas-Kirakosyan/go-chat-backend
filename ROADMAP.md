@@ -27,8 +27,10 @@ Each stage ends with something running. No stage is only reading.
 
 ## Stage 0 — Graceful shutdown
 
-**Status:** not done. The code is written but commented out in
-[`cmd/api/main.go`](cmd/api/main.go).
+**Status:** done. Signal handling, drain and ordered close live in
+[`cmd/api/main.go`](cmd/api/main.go) and `App.Shutdown` in
+[`internal/server/server.go`](internal/server/server.go). Measured numbers are in the
+README.
 
 - Listen for `SIGINT` and `SIGTERM`.
 - Stop accepting new requests, let open ones finish, then close the database.
@@ -217,7 +219,7 @@ worked on one.
 
 ## Progress
 
-- [ ] Stage 0 — Graceful shutdown
+- [x] Stage 0 — Graceful shutdown
 - [ ] Stage 1 — WebSocket delivery, one node
 - [ ] Stage 2 — Observability and safety
 - [ ] Stage 3 — Two nodes, Redis Pub/Sub, presence

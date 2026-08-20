@@ -1,66 +1,57 @@
 package main
 
 import (
-	// "context"
-	// "fmt"
-	// "log"
-	// "net/http"
-	// "os/signal"
-	// "syscall"
-	// "time"
+	"context"
+	"errors"
+	"log"
+	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
 
 	"go-chat-backend/internal/server"
-	"log"
 )
 
-// func gracefulShutdown(apiServer *http.Server, done chan bool) {
-// 	// Create context that listens for the interrupt signal from the OS.
-// 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-// 	defer stop()
-
-// 	// Listen for the interrupt signal.
-// 	<-ctx.Done()
-
-// 	log.Println("shutting down gracefully, press Ctrl+C again to force")
-// 	stop() // Allow Ctrl+C to force shutdown
-
-// 	// The context is used to inform the server it has 5 seconds to finish
-// 	// the request it is currently handling
-// 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-// 	defer cancel()
-// 	if err := apiServer.Shutdown(ctx); err != nil {
-// 		log.Printf("Server forced to shutdown with error: %v", err)
-// 	}
-
-// 	log.Println("Server exiting")
-
-// 	// Notify the main goroutine that the shutdown is complete
-// 	done <- true
-// }
+// shutdownTimeout is how long a request that is already running gets to finish
+// after the signal arrives.
+//
+// Kubernetes sends SIGKILL 30 seconds after SIGTERM by default, so this stays
+// well under that: a shutdown that outlives the grace period is not a graceful
+// shutdown, it is a kill with extra steps.
+const shutdownTimeout = 10 * time.Second
 
 func main() {
-	srv := server.NewServer()
+	app := server.New()
 
-	log.Println("Server starting on", srv.Addr)
-	if err := srv.ListenAndServe(); err != nil {
-		log.Fatal(err)
+	// NotifyContext cancels ctx when the first signal arrives. Calling stop()
+	// afterwards puts the default behaviour back, so a second Ctrl+C kills the
+	// process at once instead of waiting politely for a request that is never
+	// going to end.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	go func() {
+		log.Println("server starting on", app.HTTP.Addr)
+
+		// ListenAndServe always returns a non-nil error. After Shutdown that
+		// error is ErrServerClosed, which is the healthy path and not a crash,
+		// so it must not be treated as one.
+		if err := app.HTTP.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Fatalf("http server error: %v", err)
+		}
+	}()
+
+	<-ctx.Done()
+	stop()
+	log.Println("shutting down, press Ctrl+C again to force")
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+	defer cancel()
+
+	if err := app.Shutdown(shutdownCtx); err != nil {
+		log.Fatalf("shutdown failed: %v", err)
 	}
+
+	log.Println("server exited cleanly")
 }
-
-// s.Run(":8080")
-// server := server.NewServer()
-
-// // Create a done channel to signal when the shutdown is complete
-// done := make(chan bool, 1)
-
-// // Run graceful shutdown in a separate goroutine
-// go gracefulShutdown(server, done)
-
-// err := server.ListenAndServe()
-// if err != nil && err != http.ErrServerClosed {
-// 	panic(fmt.Sprintf("http server error: %s", err))
-// }
-
-// // Wait for the graceful shutdown to complete
-// <-done
-// log.Println("Graceful shutdown complete.")

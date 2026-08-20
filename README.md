@@ -153,6 +153,51 @@ The unique index covers `(conversation_id, sender_id, client_msg_id)`, so the
 key only has to be unique per sender and two clients picking the same string
 never collide.
 
+## Shutdown
+
+`SIGINT` or `SIGTERM` starts an orderly stop, and the order matters:
+
+1. `http.Server.Shutdown` refuses new connections and **waits** for the
+   requests already running.
+2. Only then is the database closed.
+
+The other way round breaks exactly the requests the shutdown was trying to
+protect: they are still reading and writing rows, and they would fail with
+`sql: database is closed`. Stop the traffic first, then close what the traffic
+needed.
+
+The database is closed even when step 1 fails or runs out of time. A request
+that never returns makes `Shutdown` give back `context.DeadlineExceeded`, and
+the process is exiting either way, so holding the pool open helps nobody.
+`errors.Join` keeps both errors instead of hiding one.
+
+A second `Ctrl+C` kills at once. `signal.NotifyContext` is stopped as soon as
+the first signal is handled, which puts the default behaviour back, so a
+shutdown that hangs is never a trap.
+
+`ListenAndServe` always returns a non-nil error, and after `Shutdown` that
+error is `http.ErrServerClosed`. That is the healthy path. Logging it as a
+crash would make every clean stop look like a failure.
+
+### Measured
+
+| Case | Result |
+| ---- | ------ |
+| `Ctrl+C`, nothing in flight | clean, immediate |
+| `docker stop`, nothing in flight | clean, 525 ms, exit code 0 |
+| `docker stop -t 30`, a 5 s request in flight | request finished **200**, container exited **0** after 5.26 s |
+| `docker stop` (default grace), same 5 s request | request cut at 3.4 s, exit code **137** (SIGKILL) |
+
+The last row is the useful one. `Shutdown` waited for the request exactly as it
+should — the platform gave up first and killed the container.
+
+**The platform's grace period is a hard cap on your shutdown timeout.** Ours is
+10 seconds, but a plain `docker stop` here killed the container after about
+3.4 seconds, so those 10 seconds could never be used. Kubernetes allows 30
+seconds by default (`terminationGracePeriodSeconds`), which leaves room for a
+10-second drain. A shutdown timeout longer than the grace period is not a
+promise, it is a `SIGKILL` waiting to happen.
+
 ## Configuration
 
 Create a `.env` file in the project root (it is gitignored):

@@ -124,6 +124,28 @@ func (s *service) AddMember(ctx context.Context, conversationID, userID uint) (*
 	return member, nil
 }
 
+// ListConversationMemberIDs returns the ids of everyone in a room.
+//
+// It runs on the send path, once per message, so it reads as little as
+// possible: Pluck asks Postgres for one column and skips building user
+// structs. The lookup uses the same (conversation_id, user_id) index that
+// EnsureMember hits.
+//
+// A room that does not exist is not an error here. It answers an empty list,
+// and the caller has already checked membership with EnsureMember anyway.
+func (s *service) ListConversationMemberIDs(ctx context.Context, conversationID uint) ([]uint, error) {
+	var ids []uint
+
+	err := s.db.WithContext(ctx).
+		Model(&ConversationMember{}).
+		Where("conversation_id = ?", conversationID).
+		Pluck("user_id", &ids).Error
+	if err != nil {
+		return nil, fmt.Errorf("select member ids: %w", err)
+	}
+	return ids, nil
+}
+
 // CreateMessage stores one message. When clientMsgID is not nil and this
 // sender already used it in this room, nothing is written: the first message
 // comes back with created set to false.

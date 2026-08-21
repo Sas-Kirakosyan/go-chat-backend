@@ -46,8 +46,12 @@ because you cannot tell a real bug from a rude exit.
 
 ## Stage 1 — WebSocket delivery, one node
 
-The hub the README already promises. Writes keep going over REST. The socket
-only pushes out rows that `POST /conversations/:id/messages` already stored.
+**Status:** done. The hub is in [`internal/ws`](internal/ws), the handler in
+[`internal/server/ws.go`](internal/server/ws.go), and the load tool in
+[`cmd/wsload`](cmd/wsload). Measured numbers are in the README.
+
+Writes keep going over REST. The socket only pushes out rows that
+`POST /conversations/:id/messages` already stored.
 
 - `GET /ws`, authenticated with the access token.
 - One goroutine reading and one goroutine writing per client.
@@ -62,6 +66,16 @@ backpressure, races. Go interviews dig here hardest.
 
 **Break it:** connect 5000 clients. Attach a client that never reads. Kill the
 network on one client without closing the socket.
+
+**What broke, and what it taught:**
+
+- 5000 sockets connected fine — but only at 64 dials at a time. Opening them
+  256 at a time overflowed the accept queue and 4384 of 5000 were refused.
+- The fan-out was never the bottleneck. The hub's queue never filled once; the
+  database pool sat at 25 of 25 and piled up 17.8 s of waiting in four seconds
+  of traffic. The p99 was a message waiting for a database handle.
+- A client that never reads took about 0.8 MB before the hub noticed. The
+  kernel's own buffers hide it until they are full.
 
 **Size:** 1–2 weeks.
 
@@ -220,7 +234,7 @@ worked on one.
 ## Progress
 
 - [x] Stage 0 — Graceful shutdown
-- [ ] Stage 1 — WebSocket delivery, one node
+- [x] Stage 1 — WebSocket delivery, one node
 - [ ] Stage 2 — Observability and safety
 - [ ] Stage 3 — Two nodes, Redis Pub/Sub, presence
 - [ ] Stage 4 — Delivery guarantees

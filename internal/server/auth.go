@@ -123,6 +123,32 @@ func (s *Server) signAccessToken(userID uint, username string) (string, error) {
 	return jwt.NewWithClaims(jwt.SigningMethodHS256, claims).SignedString(s.jwtKey)
 }
 
+// errInvalidToken is what parseAccessToken returns for anything wrong with the
+// token: a bad signature, the wrong algorithm, an expired token, a malformed
+// string. The caller answers 401 to all of them, and saying which one it was
+// would only help someone forging tokens.
+var errInvalidToken = errors.New("invalid access token")
+
+// parseAccessToken checks the signature and the expiry, and hands back what
+// the token says.
+//
+// AuthMiddleware and the WebSocket handler both call it, so there is exactly
+// one place that decides a token is good.
+func (s *Server) parseAccessToken(tokenStr string) (*Claims, error) {
+	claims := &Claims{}
+
+	// WithValidMethods pins HS256. Without it a forged token could name "none"
+	// as its algorithm and be accepted with no signature at all.
+	token, err := jwt.ParseWithClaims(tokenStr, claims, func(t *jwt.Token) (interface{}, error) {
+		return s.jwtKey, nil
+	}, jwt.WithValidMethods([]string{jwt.SigningMethodHS256.Alg()}))
+
+	if err != nil || !token.Valid {
+		return nil, errInvalidToken
+	}
+	return claims, nil
+}
+
 func (s *Server) AuthMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		tokenStr, ok := bearerToken(c.GetHeader("Authorization"))
@@ -131,12 +157,8 @@ func (s *Server) AuthMiddleware() gin.HandlerFunc {
 			return
 		}
 
-		claims := &Claims{}
-		token, err := jwt.ParseWithClaims(tokenStr, claims, func(t *jwt.Token) (interface{}, error) {
-			return s.jwtKey, nil
-		}, jwt.WithValidMethods([]string{jwt.SigningMethodHS256.Alg()}))
-
-		if err != nil || !token.Valid {
+		claims, err := s.parseAccessToken(tokenStr)
+		if err != nil {
 			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "Invalid token"})
 			return
 		}

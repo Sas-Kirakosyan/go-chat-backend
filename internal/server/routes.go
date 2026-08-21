@@ -19,7 +19,17 @@ func (s *Server) healthHandler(c *gin.Context) {
 }
 
 func (s *Server) RegisterRoutes() *gin.Engine {
-	r := gin.Default()
+	// This is gin.Default() written out, with one change: the request logger
+	// skips /ws.
+	//
+	// A socket carries its access token in the query string, because a browser
+	// cannot put it in a header. Logging the request line would then write that
+	// token into the log on every connect, which is exactly the leak the choice
+	// was trying to keep small. The connect is still visible — the ws package
+	// logs what matters about a socket — just without the credential.
+	r := gin.New()
+	r.Use(gin.LoggerWithConfig(gin.LoggerConfig{SkipPaths: []string{"/ws"}}))
+	r.Use(gin.Recovery())
 
 	r.Use(cors.New(cors.Config{
 		AllowOrigins:     []string{"http://localhost:5173"},
@@ -33,6 +43,11 @@ func (s *Server) RegisterRoutes() *gin.Engine {
 
 	r.POST("/register", s.RegisterHandler)
 	r.POST("/login", s.LoginHandler)
+
+	// The socket sits outside the auth group on purpose. A browser cannot put
+	// an Authorization header on a WebSocket, so the token arrives as ?token=
+	// and the handler checks it itself, before the upgrade.
+	r.GET("/ws", s.WSHandler)
 
 	// Two groups share the /auth prefix on purpose, because they are guarded
 	// by two different things.

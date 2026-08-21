@@ -81,6 +81,31 @@ func TestConversationStore(t *testing.T) {
 	if err := srv.EnsureMember(ctx, conv.ID, outsider.ID); err != nil {
 		t.Fatalf("EnsureMember() after AddMember returned %v", err)
 	}
+
+	// The WebSocket fan-out reads this on every send: the ids of everyone who
+	// should receive the message, and nothing else.
+	ids, err := srv.ListConversationMemberIDs(ctx, conv.ID)
+	if err != nil {
+		t.Fatalf("ListConversationMemberIDs() returned %v", err)
+	}
+	if len(ids) != 3 {
+		t.Fatalf("ListConversationMemberIDs() = %v, want the 3 members", ids)
+	}
+	found := map[uint]bool{}
+	for _, id := range ids {
+		found[id] = true
+	}
+	for _, want := range []uint{owner.ID, invited.ID, outsider.ID} {
+		if !found[want] {
+			t.Fatalf("ListConversationMemberIDs() = %v, missing user %d", ids, want)
+		}
+	}
+
+	// A room that does not exist is an empty list, not an error. The caller
+	// has already checked membership with EnsureMember.
+	if ids, err := srv.ListConversationMemberIDs(ctx, conv.ID+999999); err != nil || len(ids) != 0 {
+		t.Fatalf("ListConversationMemberIDs(missing room) = %v, %v; want no ids and no error", ids, err)
+	}
 }
 
 func TestMessageStore(t *testing.T) {

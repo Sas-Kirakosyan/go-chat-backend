@@ -16,6 +16,15 @@ run:
 seed:
 	@go run cmd/seed/main.go $(ARGS)
 
+# Load test the WebSocket hub against a running server. Seed first: it logs in
+# as the users cmd/seed created.
+#
+#   make seed ARGS="-n 5000"
+#   make wsload ARGS="-n 5000 -messages 20"
+#   make wsload ARGS="-n 100 -slow 5 -size 4000 -messages 600"   # slow clients
+wsload:
+	@go run ./cmd/wsload $(ARGS)
+
 # Migrations. The server applies them itself on startup; these are for looking
 # before you leap, and for stepping back after a mistake.
 migrate-status:
@@ -75,5 +84,5 @@ watch:
 		Write-Output 'Watching...'; \
 	}"
 
-.PHONY: all build run seed test clean watch docker-run docker-down itest \
+.PHONY: all build run seed wsload test clean watch docker-run docker-down itest \
 	migrate-status migrate-up migrate-down migration

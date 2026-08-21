@@ -100,6 +100,15 @@ func (f *fakeDB) AddMember(_ context.Context, conversationID, userID uint) (*dat
 	}, nil
 }
 
+func (f *fakeDB) ListConversationMemberIDs(_ context.Context, conversationID uint) ([]uint, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	// A copy, not the slice itself: the caller hands it to the hub, which
+	// reads it on another goroutine while AddMember may still append here.
+	return append([]uint(nil), f.memberIDs[conversationID]...), nil
+}
+
 func (f *fakeDB) CreateMessage(_ context.Context, conversationID, senderID uint, content string, clientMsgID *string) (*database.Message, bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()

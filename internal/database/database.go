@@ -96,6 +96,11 @@ type Service interface {
 	// EnsureMember first.
 	AddMember(ctx context.Context, conversationID, userID uint) (*ConversationMember, error)
 
+	// ListConversationMemberIDs returns the ids of everyone in a room, and
+	// nothing else. The WebSocket fan-out calls it on every send to learn who
+	// should receive the message, so it reads ids only, not whole user rows.
+	ListConversationMemberIDs(ctx context.Context, conversationID uint) ([]uint, error)
+
 	// CreateMessage stores one message. When clientMsgID is not nil and this
 	// sender already used it in this room, nothing is written: the first
 	// message comes back with created set to false.

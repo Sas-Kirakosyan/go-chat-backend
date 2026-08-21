@@ -223,6 +223,13 @@ func (s *Server) SendMessageHandler(c *gin.Context) {
 		status = http.StatusOK
 	}
 	c.JSON(status, out)
+
+	// Only a real new row is pushed. A retry stored nothing, so pushing again
+	// would show the same line twice on every screen in the room — the exact
+	// double-post that client_msg_id exists to prevent.
+	if created {
+		s.broadcastMessage(c, conversationID, out)
+	}
 }
 
 // ListMessagesHandler handles GET /conversations/:id/messages.

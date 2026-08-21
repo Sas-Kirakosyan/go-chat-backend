@@ -13,6 +13,7 @@ import (
 	"gorm.io/gorm"
 
 	"go-chat-backend/internal/database"
+	"go-chat-backend/internal/ws"
 )
 
 // fakeDB is an in-memory database.Service so the HTTP layer can be tested
@@ -93,7 +94,15 @@ func newTestServer(t *testing.T) (*Server, *gin.Engine, *fakeDB) {
 	t.Helper()
 	gin.SetMode(gin.TestMode)
 	db := newFakeDB()
-	s := &Server{port: 8080, db: db, jwtKey: []byte("test-secret")}
+
+	// Every test gets its own hub, and Cleanup stops it. A hub left running
+	// leaks its goroutine, and the race detector would report the leftovers of
+	// one test inside the next.
+	hub := ws.New()
+	go hub.Run()
+	t.Cleanup(hub.Close)
+
+	s := &Server{port: 8080, db: db, jwtKey: []byte("test-secret"), hub: hub}
 	return s, s.RegisterRoutes(), db
 }
 

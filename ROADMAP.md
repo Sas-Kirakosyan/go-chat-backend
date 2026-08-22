@@ -93,6 +93,10 @@ One node still, but now you can see inside it.
   different questions.
 - Rate limiting per user.
 - Panic recovery that logs and keeps the process up.
+- **Close a socket whose token has died.** Stage 1 checks the token only at the
+  handshake, so an open socket survives both expiry and logout — proved by
+  `TestSocketOutlivesItsExpiredToken` and `TestSocketOutlivesLogout`. Decide
+  between re-checking on a timer and closing at the known expiry time.
 
 **Learn:** how to answer "how do you know your service is healthy?" — and how
 to prove it instead of guessing.

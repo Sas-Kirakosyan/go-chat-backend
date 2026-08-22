@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/golang-jwt/jwt/v5"
 	"github.com/gorilla/websocket"
 )
 
@@ -299,6 +300,52 @@ func TestARealClientThatNeverReadsIsDropped(t *testing.T) {
 	}
 }
 
+// Order must not matter. A socket is opened per USER, not per room, and the
+// member list is read from the database on every send — so a room made after
+// the socket opened, and a room somebody adds you to later, both reach you
+// with no reconnect.
+//
+// This is the test that earns that design choice. Had the hub instead loaded
+// each user's rooms once at connect time, both halves below would fail.
+func TestRoomsJoinedAfterConnectingStillDeliver(t *testing.T) {
+	srv, _, r := newWSTestServer(t)
+	alice, aliceID := signUp(t, r, "alice")
+	bob, bobID := signUp(t, r, "bob")
+
+	// The socket comes first, before any room exists at all.
+	conn := connect(t, srv, alice)
+
+	// Half one: a room created after the socket was already open.
+	fresh := createRoom(t, r, alice, bobID)
+	path := fmt.Sprintf("/conversations/%d/messages", fresh)
+	if rr := do(t, r, "POST", path, `{"content":"new room"}`, bob); rr.Code != http.StatusCreated {
+		t.Fatalf("send to the new room: got %d (body %s)", rr.Code, rr.Body)
+	}
+
+	var msg messageDTO
+	decode(t, readFrame(t, conn).Data, &msg)
+	if msg.Content != "new room" {
+		t.Fatalf("first frame: got %+v, want the new room's message", msg)
+	}
+
+	// Half two: a room Alice is added to later, by somebody else.
+	theirs := createRoom(t, r, bob)
+	members := fmt.Sprintf("/conversations/%d/members", theirs)
+	if rr := do(t, r, "POST", members, fmt.Sprintf(`{"user_id":%d}`, aliceID), bob); rr.Code != http.StatusCreated {
+		t.Fatalf("add member: got %d (body %s)", rr.Code, rr.Body)
+	}
+
+	path = fmt.Sprintf("/conversations/%d/messages", theirs)
+	if rr := do(t, r, "POST", path, `{"content":"added later"}`, bob); rr.Code != http.StatusCreated {
+		t.Fatalf("send to the joined room: got %d (body %s)", rr.Code, rr.Body)
+	}
+
+	decode(t, readFrame(t, conn).Data, &msg)
+	if msg.Content != "added later" {
+		t.Fatalf("second frame: got %+v, want the joined room's message", msg)
+	}
+}
+
 // A closed hub must not take the write path down with it. The message is still
 // stored and the sender still gets a 201; only the live push is missed.
 func TestSendStillWorksAfterTheHubIsClosed(t *testing.T) {
@@ -315,8 +362,137 @@ func TestSendStillWorksAfterTheHubIsClosed(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// What happens to a live socket when the credential behind it dies?
+//
+// The token is checked once, during the handshake, and never again. These two
+// tests exist to say out loud what that means, and to notice the day it
+// changes. They are not asserting that the behaviour is right — they are
+// pinning down what it is.
+// ---------------------------------------------------------------------------
+
+// The other half of the picture: an expired token cannot OPEN a socket. Put
+// next to the test below, the two say exactly where the check happens — at the
+// handshake, and only there.
+func TestWSRejectsAnExpiredToken(t *testing.T) {
+	srv, s, r := newWSTestServer(t)
+	_, aliceID := signUp(t, r, "alice")
+
+	expired := signTokenExpiringIn(t, s, aliceID, "alice", -time.Minute)
+
+	_, resp, err := dialWS(t, srv, "?token="+expired, nil)
+	if err == nil {
+		t.Fatal("an expired token opened a socket")
+	}
+	if resp == nil || resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("status: got %v, want %d", resp, http.StatusUnauthorized)
+	}
+}
+
+// A socket opened with a valid token keeps working after that token expires.
+func TestSocketOutlivesItsExpiredToken(t *testing.T) {
+	srv, s, r := newWSTestServer(t)
+	alice, aliceID := signUp(t, r, "alice")
+	bob, bobID := signUp(t, r, "bob")
+	room := createRoom(t, r, alice, bobID)
+
+	// A token with a one-second life, so the test does not wait 15 minutes.
+	short := signTokenExpiringIn(t, s, aliceID, "alice", time.Second)
+
+	conn, resp, err := dialWS(t, srv, "?token="+short, nil)
+	if err != nil {
+		status := 0
+		if resp != nil {
+			status = resp.StatusCode
+		}
+		t.Fatalf("dial with a valid token: %v (status %d)", err, status)
+	}
+	if frame := readFrame(t, conn); frame.Type != "connected" {
+		t.Fatalf("first frame: got %q, want \"connected\"", frame.Type)
+	}
+
+	time.Sleep(1500 * time.Millisecond)
+
+	// Prove the token really is dead before drawing any conclusion from the
+	// socket. Without this the test could pass for the wrong reason.
+	if rr := do(t, r, "GET", "/auth/profile", "", "Bearer "+short); rr.Code != http.StatusUnauthorized {
+		t.Fatalf("the token has not expired yet: /auth/profile answered %d", rr.Code)
+	}
+
+	path := fmt.Sprintf("/conversations/%d/messages", room)
+	if rr := do(t, r, "POST", path, `{"content":"after expiry"}`, bob); rr.Code != http.StatusCreated {
+		t.Fatalf("send: got %d (body %s)", rr.Code, rr.Body)
+	}
+
+	// The socket is still being served, with a credential REST now refuses.
+	frame := readFrame(t, conn)
+	if frame.Type != wsMessageEvent {
+		t.Fatalf("type: got %q, want %q", frame.Type, wsMessageEvent)
+	}
+	var msg messageDTO
+	decode(t, frame.Data, &msg)
+	if msg.Content != "after expiry" {
+		t.Fatalf("pushed message: got %+v", msg)
+	}
+}
+
+// A socket keeps working after the user logs out.
+func TestSocketOutlivesLogout(t *testing.T) {
+	srv, _, r := newWSTestServer(t)
+	aliceToken, aliceCookie := loginFor(t, r, "alice")
+	bob, bobID := signUp(t, r, "bob")
+	room := createRoom(t, r, "Bearer "+aliceToken, bobID)
+
+	conn := connect(t, srv, "Bearer "+aliceToken)
+
+	if rr := doWithCookie(t, r, "POST", "/auth/logout", "", aliceCookie.Value); rr.Code != http.StatusOK {
+		t.Fatalf("logout: got %d (body %s)", rr.Code, rr.Body)
+	}
+	// Prove the session is really gone, or the rest of the test proves nothing.
+	if rr := doWithCookie(t, r, "POST", "/auth/refresh", "", aliceCookie.Value); rr.Code != http.StatusUnauthorized {
+		t.Fatalf("the session survived logout: refresh answered %d", rr.Code)
+	}
+
+	path := fmt.Sprintf("/conversations/%d/messages", room)
+	if rr := do(t, r, "POST", path, `{"content":"after logout"}`, bob); rr.Code != http.StatusCreated {
+		t.Fatalf("send: got %d (body %s)", rr.Code, rr.Body)
+	}
+
+	frame := readFrame(t, conn)
+	if frame.Type != wsMessageEvent {
+		t.Fatalf("type: got %q, want %q", frame.Type, wsMessageEvent)
+	}
+	var msg messageDTO
+	decode(t, frame.Data, &msg)
+	if msg.Content != "after logout" {
+		t.Fatalf("pushed message: got %+v", msg)
+	}
+}
+
+// ---------------------------------------------------------------------------
 // Helpers used only here
 // ---------------------------------------------------------------------------
+
+// signTokenExpiringIn mints an access token with a chosen life, so a test can
+// watch one expire without waiting for the real 15 minutes.
+func signTokenExpiringIn(t *testing.T, s *Server, userID uint, username string, ttl time.Duration) string {
+	t.Helper()
+
+	claims := &Claims{
+		UserID:   userID,
+		Username: username,
+		RegisteredClaims: jwt.RegisteredClaims{
+			Subject:   username,
+			IssuedAt:  jwt.NewNumericDate(time.Now()),
+			ExpiresAt: jwt.NewNumericDate(time.Now().Add(ttl)),
+		},
+	}
+
+	tok, err := jwt.NewWithClaims(jwt.SigningMethodHS256, claims).SignedString(s.jwtKey)
+	if err != nil {
+		t.Fatalf("sign token: %v", err)
+	}
+	return tok
+}
 
 // createRoom makes a room owned by the caller and returns its id.
 func createRoom(t *testing.T, r *gin.Engine, authHeader string, memberIDs ...uint) uint {

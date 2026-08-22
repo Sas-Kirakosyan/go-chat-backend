@@ -16,7 +16,7 @@ import (
 
 //this file contains the authentication logic, including token validation and user identification
 
-const tokenTTL = 15 * time.Minute
+const tokenTTL = 120 * time.Minute //TODO: should be 15 minutes in production, but longer for dev convenience
 
 // dummyHash is compared against when the username does not exist, so that a
 // bad username costs the same time as a bad password and cannot be

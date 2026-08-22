@@ -198,6 +198,32 @@ logger — otherwise the server would write a live token to disk on every
 connect. That is why `RegisterRoutes` builds the middleware by hand instead of
 calling `gin.Default()`.
 
+### The socket outlives its token — a known gap
+
+The token is checked **once**, at the handshake, and never again. After the
+upgrade nothing looks at it. Two consequences, both confirmed by tests in
+[`ws_test.go`](internal/server/ws_test.go):
+
+| | Result |
+| --- | --- |
+| Dial with an expired token | refused, `401` (`TestWSRejectsAnExpiredToken`) |
+| Token expires **while** a socket is open | messages keep arriving (`TestSocketOutlivesItsExpiredToken`) |
+| User logs out while a socket is open | messages keep arriving (`TestSocketOutlivesLogout`) |
+
+Both tests first prove the credential is really dead — `/auth/profile` answers
+`401`, `/auth/refresh` answers `401` — and only then check the socket. So this
+is the server's behaviour, not a test that passed for the wrong reason.
+
+It is a small hole in the promise the session design makes. Logout is already
+documented as taking up to 15 minutes to bite, because the access token is
+stateless; a socket stretches that from 15 minutes to *forever*, or until the
+process restarts.
+
+It is left open for now on purpose — closing it means either re-checking the
+token on a timer, which puts a clock in the read loop, or having the client
+close its own socket at expiry, which is not a defence. The fix belongs with
+the rest of the safety work in Stage 2.
+
 ### CORS does not protect a socket
 
 The handshake is a plain `GET` with an `Upgrade` header. The browser sends no

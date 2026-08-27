@@ -9,6 +9,7 @@ import (
 	"github.com/gin-gonic/gin"
 
 	"go-chat-backend/internal/database"
+	"go-chat-backend/internal/metrics"
 )
 
 // History is read in pages, newest first. A client that sends no limit gets
@@ -227,7 +228,11 @@ func (s *Server) SendMessageHandler(c *gin.Context) {
 	// Only a real new row is pushed. A retry stored nothing, so pushing again
 	// would show the same line twice on every screen in the room — the exact
 	// double-post that client_msg_id exists to prevent.
+	//
+	// The counter follows the same rule, so rate() over it is the real write
+	// rate rather than the request rate.
 	if created {
+		metrics.MessagesStored.Inc()
 		s.broadcastMessage(c, conversationID, out)
 	}
 }

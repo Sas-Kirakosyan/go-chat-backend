@@ -3,7 +3,7 @@ package main
 import (
 	"context"
 	"errors"
-	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
@@ -22,6 +22,9 @@ import (
 const shutdownTimeout = 10 * time.Second
 
 func main() {
+	// server.New installs the structured logger before it does anything else,
+	// so every slog call below writes in the same format as the rest of the
+	// service.
 	app := server.New()
 
 	// NotifyContext cancels ctx when the first signal arrives. Calling stop()
@@ -32,26 +35,28 @@ func main() {
 	defer stop()
 
 	go func() {
-		log.Println("server starting on", app.HTTP.Addr)
+		slog.Info("server starting", "addr", app.HTTP.Addr)
 
 		// ListenAndServe always returns a non-nil error. After Shutdown that
 		// error is ErrServerClosed, which is the healthy path and not a crash,
 		// so it must not be treated as one.
 		if err := app.HTTP.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			log.Fatalf("http server error: %v", err)
+			slog.Error("http server failed", "err", err)
+			os.Exit(1)
 		}
 	}()
 
 	<-ctx.Done()
 	stop()
-	log.Println("shutting down, press Ctrl+C again to force")
+	slog.Info("shutting down, press Ctrl+C again to force")
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer cancel()
 
 	if err := app.Shutdown(shutdownCtx); err != nil {
-		log.Fatalf("shutdown failed: %v", err)
+		slog.Error("shutdown failed", "err", err)
+		os.Exit(1)
 	}
 
-	log.Println("server exited cleanly")
+	slog.Info("server exited cleanly")
 }

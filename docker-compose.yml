@@ -50,5 +50,22 @@ services:
     ports:
       - "8080:8080"
 
+  # Not started by default. `docker compose up` should stay a database and an
+  # API; watching graphs is a thing you ask for:
+  #
+  #   docker compose --profile observability up -d
+  #
+  # Stage 7 adds Grafana on top of this, which is why the scrape config lives
+  # in the repo rather than being typed into a UI.
+  prometheus:
+    image: prom/prometheus:v3.1.0
+    profiles: ["observability"]
+    depends_on:
+      - api
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9090:9090"
+
 volumes:
   psql_volume_bp:

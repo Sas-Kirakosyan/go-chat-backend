@@ -1,0 +1,20 @@
+# Prometheus for local use. Started only with the compose profile:
+#
+#   docker compose --profile observability up -d
+#
+# Then http://localhost:9090 — try:
+#   rate(chat_http_requests_total[1m])
+#   histogram_quantile(0.99, sum by (le, route) (rate(chat_http_request_duration_seconds_bucket[1m])))
+#   chat_ws_connections_open
+#   rate(chat_messages_stored_total[1m])
+global:
+  # 5 seconds rather than the usual 15: this is one machine being watched by
+  # hand, and a load test that lasts 20 seconds needs more than one data point.
+  scrape_interval: 5s
+
+scrape_configs:
+  - job_name: chat-api
+    static_configs:
+      # The compose service name, on its own network. Not localhost: inside a
+      # container that would be the Prometheus container itself.
+      - targets: ["api:8080"]

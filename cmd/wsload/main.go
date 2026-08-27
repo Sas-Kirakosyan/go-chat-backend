@@ -19,13 +19,16 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"log"
+	"math/rand"
 	"net/http"
 	"net/url"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -315,22 +318,36 @@ func connectAll(cfg config, tokens []string) (*fleet, error) {
 
 			url := wsBase + "/ws?token=" + url.QueryEscape(token)
 
-			// A refused connection is worth one or two retries, exactly as a
-			// real client would. Backing off is what turns a full accept queue
-			// from an error into a wait.
+			// A refused connection is worth retrying, exactly as a real client
+			// would. Backing off is what turns a full accept queue — or a rate
+			// limiter — from an error into a wait.
+			//
+			// There are two different refusals here and they need different
+			// waits. A full accept queue clears in milliseconds. A 429 clears
+			// when the token bucket refills, which the server states in
+			// Retry-After, and coming back sooner than that is guaranteed to be
+			// refused again.
 			var conn *websocket.Conn
 			var err error
-			for attempt := range 4 {
+			for attempt := range maxAttempts {
 				if attempt > 0 {
 					mu.Lock()
 					retried++
 					mu.Unlock()
-					time.Sleep(time.Duration(attempt*attempt) * 200 * time.Millisecond)
 				}
-				if conn, _, err = dialer.Dial(url, nil); err == nil {
+
+				var resp *http.Response
+				conn, resp, err = dialer.Dial(url, nil)
+				if err == nil {
 					f.conns[i] = conn
 					return
 				}
+
+				wait := time.Duration(attempt*attempt) * 200 * time.Millisecond
+				if resp != nil && resp.StatusCode == http.StatusTooManyRequests {
+					wait = min(retryAfter(resp)*(1<<attempt), maxBackoff)
+				}
+				time.Sleep(wait + time.Duration(rand.Int63n(int64(200*time.Millisecond))))
 			}
 
 			mu.Lock()
@@ -531,12 +548,65 @@ func percentile(sorted []time.Duration, p int) time.Duration {
 // Small HTTP helpers
 // ---------------------------------------------------------------------------
 
+// Backing off when the server says "too many".
+//
+// The server rate limits by IP, and this tool is one IP pretending to be
+// thousands of people, so it is the first thing to be told to slow down. The
+// answer is not to turn the limit off — that would load test a server we do
+// not ship — but to behave like a real client: wait for as long as Retry-After
+// says, then try again.
+// The wait doubles on each attempt, starting from what the server asked for.
+// Retry-After answers "when is the next token free", which is true for one
+// caller — but here a hundred goroutines are queued at the same bucket, so
+// coming back after exactly one second means most of them are refused again.
+// Doubling is how the crowd spreads itself out.
+//
+// A run of thousands of users should raise the server's limit instead of
+// relying on this. At five logins a second, 5000 logins take a quarter of an
+// hour however patient the client is:
+//
+//	RATE_LIMIT_AUTH_RPS=2000 RATE_LIMIT_API_RPS=5000 make run
+const (
+	maxAttempts = 8
+
+	// A cap on one wait, so a deep queue — or a hostile Retry-After — cannot
+	// park a goroutine for minutes.
+	maxBackoff = 10 * time.Second
+)
+
 func postJSON(client *http.Client, url, token string, body, into any) error {
 	raw, err := json.Marshal(body)
 	if err != nil {
 		return err
 	}
 
+	for attempt := 1; ; attempt++ {
+		err := postOnce(client, url, token, raw, into)
+
+		var limited rateLimitedError
+		if !errors.As(err, &limited) || attempt == maxAttempts {
+			return err
+		}
+
+		// Jitter matters as much as the wait itself. Every goroutine here was
+		// refused at the same moment by the same bucket, so waiting exactly the
+		// same time would send them all back together and the second wave would
+		// be refused just like the first.
+		wait := min(limited.retryAfter*(1<<(attempt-1)), maxBackoff)
+		time.Sleep(wait + time.Duration(rand.Int63n(int64(500*time.Millisecond))))
+	}
+}
+
+// rateLimitedError is a 429 with the server's own advice about when to return.
+type rateLimitedError struct {
+	retryAfter time.Duration
+}
+
+func (e rateLimitedError) Error() string {
+	return fmt.Sprintf("429 Too Many Requests (retry after %s)", e.retryAfter)
+}
+
+func postOnce(client *http.Client, url, token string, raw []byte, into any) error {
 	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(raw))
 	if err != nil {
 		return err
@@ -552,6 +622,13 @@ func postJSON(client *http.Client, url, token string, body, into any) error {
 	}
 	defer resp.Body.Close()
 
+	if resp.StatusCode == http.StatusTooManyRequests {
+		// The body has to be drained even when it is thrown away, or the
+		// connection cannot go back into the pool and every retry opens a new
+		// one.
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 512))
+		return rateLimitedError{retryAfter: retryAfter(resp)}
+	}
 	if resp.StatusCode >= 300 {
 		answer, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
 		return fmt.Errorf("%s: %s", resp.Status, bytes.TrimSpace(answer))
@@ -561,6 +638,16 @@ func postJSON(client *http.Client, url, token string, body, into any) error {
 		return nil
 	}
 	return json.NewDecoder(resp.Body).Decode(into)
+}
+
+// retryAfter reads the header, in whole seconds. A missing or unreadable value
+// means a second, which is the smallest thing the server ever asks for.
+func retryAfter(resp *http.Response) time.Duration {
+	seconds, err := strconv.Atoi(resp.Header.Get("Retry-After"))
+	if err != nil || seconds < 1 {
+		return time.Second
+	}
+	return time.Duration(seconds) * time.Second
 }
 
 // wsURL turns http://host into ws://host, and https into wss.

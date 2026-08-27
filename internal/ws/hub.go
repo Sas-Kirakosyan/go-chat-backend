@@ -10,7 +10,7 @@
 package ws
 
 import (
-	"log"
+	"log/slog"
 	"sync/atomic"
 	"time"
 
@@ -51,11 +51,17 @@ type Hub struct {
 	// ONLY run() may read or write this map.
 	clients map[uint]map[*Client]struct{}
 
-	// Counters. They are read from other goroutines (the load test, and the
-	// /metrics endpoint in Stage 2), so they are atomic.
+	// Counters. They are read from other goroutines — the load test, and
+	// Prometheus when it scrapes /metrics — so they are atomic.
+	//
+	// The metrics package reads them through an interface at scrape time
+	// instead of the hub pushing values into a metric. That keeps one source of
+	// truth per number, and keeps Prometheus out of this package.
 	open    atomic.Int64
 	dropped atomic.Int64
 	shed    atomic.Int64
+	sent    atomic.Int64
+	expired atomic.Int64
 
 	// Heartbeat timings. They are fields rather than plain constants so a test
 	// can shrink them: proving that a silent connection is noticed should take
@@ -117,14 +123,19 @@ func (h *Hub) Run() {
 // starts its two pumps. After this call the connection belongs to the hub, and
 // the caller must not read from it or write to it again.
 //
+// expiresAt is when the credential that opened this socket runs out. The
+// socket is closed at that moment. A zero time means "never", which is only
+// for a caller with no credential to speak of — the tests.
+//
 // It returns false when the hub is already closing, in which case the
 // connection is closed here and no goroutine is started.
-func (h *Hub) Add(conn *websocket.Conn, userID uint) bool {
+func (h *Hub) Add(conn *websocket.Conn, userID uint, expiresAt time.Time) bool {
 	c := &Client{
-		hub:    h,
-		conn:   conn,
-		userID: userID,
-		send:   make(chan []byte, sendBuffer),
+		hub:       h,
+		conn:      conn,
+		userID:    userID,
+		expiresAt: expiresAt,
+		send:      make(chan []byte, sendBuffer),
 	}
 
 	select {
@@ -159,10 +170,11 @@ func (h *Hub) Broadcast(userIDs []uint, payload []byte) {
 
 	default:
 		// The hub's own queue is full, which means run() is behind. Shedding
-		// this fan-out keeps the write path fast. Stage 2 puts this counter on
-		// /metrics; until then it is at least logged.
+		// this fan-out keeps the write path fast. The counter is on /metrics as
+		// chat_ws_broadcasts_shed_total; anything above zero means live
+		// delivery is losing messages.
 		h.shed.Add(1)
-		log.Printf("ws: hub queue full, dropped a fan-out to %d users", len(userIDs))
+		slog.Warn("ws hub queue full, fan-out dropped", "users", len(userIDs))
 	}
 }
 
@@ -187,6 +199,18 @@ func (h *Hub) Open() int { return int(h.open.Load()) }
 
 // Dropped is how many sockets were dropped for being too slow to read.
 func (h *Hub) Dropped() int { return int(h.dropped.Load()) }
+
+// Sent is how many frames were queued to a client. One message to a room of
+// fifty counts fifty: this is fan-out, not messages.
+func (h *Hub) Sent() int { return int(h.sent.Load()) }
+
+// Shed is how many fan-outs were thrown away because the hub's own queue was
+// full. It should be zero. Anything else means run() could not keep up and
+// live delivery lost messages.
+func (h *Hub) Shed() int { return int(h.shed.Load()) }
+
+// Expired is how many sockets were closed because their access token ran out.
+func (h *Hub) Expired() int { return int(h.expired.Load()) }
 
 // ---------------------------------------------------------------------------
 // Everything below runs on the run() goroutine, and only there.
@@ -232,6 +256,7 @@ func (h *Hub) deliver(e envelope) {
 		for c := range h.clients[userID] {
 			select {
 			case c.send <- e.payload:
+				h.sent.Add(1)
 
 			default:
 				// The client's buffer is full: it is not reading fast enough,
@@ -241,7 +266,7 @@ func (h *Hub) deliver(e envelope) {
 				// whole node. Waiting here would block run(), and run() is the
 				// single goroutine that serves every other socket.
 				h.dropped.Add(1)
-				log.Printf("ws: dropping slow client (user %d)", c.userID)
+				slog.Warn("ws dropping slow client", "user_id", c.userID)
 				h.remove(c)
 			}
 		}

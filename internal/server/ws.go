@@ -2,8 +2,8 @@ package server
 
 import (
 	"encoding/json"
-	"log"
 	"net/http"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
@@ -74,7 +74,7 @@ func (s *Server) WSHandler(c *gin.Context) {
 	if err != nil {
 		// Upgrade has already written its own HTTP error, so there is nothing
 		// left to answer with here.
-		log.Printf("ws: upgrade failed for user %d: %v", claims.UserID, err)
+		logFrom(c).Warn("ws upgrade failed", "user_id", claims.UserID, "err", err)
 		return
 	}
 
@@ -90,9 +90,21 @@ func (s *Server) WSHandler(c *gin.Context) {
 
 	// From here the hub owns the connection: it starts the read and write
 	// goroutines, and this handler must never touch conn again.
-	if !s.hub.Add(conn, claims.UserID) {
-		log.Printf("ws: hub is closing, refused socket for user %d", claims.UserID)
+	//
+	// The token's own expiry travels with the socket, and the hub closes it at
+	// that moment. Without it the check at the top of this function would be
+	// the ONLY check this connection ever gets, and a socket opened a second
+	// before the token died would go on delivering for as long as the process
+	// lived.
+	if !s.hub.Add(conn, claims.UserID, claims.ExpiresAt.Time) {
+		logFrom(c).Warn("ws hub is closing, socket refused", "user_id", claims.UserID)
+		return
 	}
+
+	logFrom(c).Info("ws connected",
+		"user_id", claims.UserID,
+		"expires_in_s", int(time.Until(claims.ExpiresAt.Time).Seconds()),
+	)
 }
 
 // wsAccessToken reads the access token for a socket.
@@ -124,7 +136,8 @@ func wsAccessToken(c *gin.Context) (string, bool) {
 func (s *Server) broadcastMessage(c *gin.Context, conversationID uint, msg messageDTO) {
 	memberIDs, err := s.db.ListConversationMemberIDs(c.Request.Context(), conversationID)
 	if err != nil {
-		log.Printf("ws: could not list members of conversation %d: %v", conversationID, err)
+		logFrom(c).Error("ws could not list room members",
+			"conversation_id", conversationID, "err", err)
 		return
 	}
 
@@ -132,7 +145,7 @@ func (s *Server) broadcastMessage(c *gin.Context, conversationID uint, msg messa
 	// cost one encode, not fifty.
 	payload, err := json.Marshal(wsEnvelope{Type: wsMessageEvent, Data: msg})
 	if err != nil {
-		log.Printf("ws: could not encode message %d: %v", msg.ID, err)
+		logFrom(c).Error("ws could not encode message", "message_id", msg.ID, "err", err)
 		return
 	}
 

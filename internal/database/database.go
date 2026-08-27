@@ -2,6 +2,7 @@ package database
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"log"
@@ -41,6 +42,11 @@ type Service interface {
 	// Health returns a map of health status information.
 	// The keys and values in the map are service-specific.
 	Health() map[string]string
+
+	// PoolStats reports the connection pool counters. Unlike Health it does not
+	// touch the database at all — it reads numbers database/sql already keeps —
+	// so it is cheap enough for Prometheus to call on every scrape.
+	PoolStats() sql.DBStats
 
 	// Migrate applies every migration in internal/database/migrations that has
 	// not run yet. It is safe to call on every start.
@@ -273,6 +279,22 @@ func (s *service) Health() map[string]string {
 	}
 
 	return stats
+}
+
+// PoolStats reports the connection pool counters.
+//
+// It reads numbers database/sql already keeps and never touches the database,
+// so Prometheus can call it on every scrape. Health, by contrast, pings.
+//
+// An unusable handle returns the zero value rather than an error: a scrape
+// must not fail, and every counter reading zero is itself the signal that
+// something is wrong.
+func (s *service) PoolStats() sql.DBStats {
+	sqlDB, err := s.db.DB()
+	if err != nil {
+		return sql.DBStats{}
+	}
+	return sqlDB.Stats()
 }
 
 // Close closes the database connection.

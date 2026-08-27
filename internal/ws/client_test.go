@@ -17,8 +17,8 @@ import (
 // milliseconds instead of the minute a real client gets.
 
 // serveHub puts the hub behind a real listener that upgrades and registers
-// whatever connects.
-func serveHub(t *testing.T, h *Hub) *httptest.Server {
+// whatever connects. A zero expiresAt means the socket has no expiry.
+func serveHub(t *testing.T, h *Hub, expiresAt time.Time) *httptest.Server {
 	t.Helper()
 
 	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
@@ -27,7 +27,7 @@ func serveHub(t *testing.T, h *Hub) *httptest.Server {
 		if err != nil {
 			return
 		}
-		h.Add(conn, 1)
+		h.Add(conn, 1, expiresAt)
 	}))
 
 	t.Cleanup(srv.Close)
@@ -73,7 +73,7 @@ func TestASilentClientIsClosedByTheHeartbeat(t *testing.T) {
 	go h.Run()
 	t.Cleanup(h.Close)
 
-	srv := serveHub(t, h)
+	srv := serveHub(t, h, time.Time{})
 	conn := dial(t, srv)
 
 	waitFor(t, time.Second, "the socket to register", func() bool { return h.Open() == 1 })
@@ -86,6 +86,56 @@ func TestASilentClientIsClosedByTheHeartbeat(t *testing.T) {
 	waitFor(t, 3*time.Second, "the hub to close the silent socket", func() bool { return h.Open() == 0 })
 }
 
+// A socket must not outlive the token that opened it.
+//
+// The token is checked once, at the handshake. Without a deadline on the
+// socket itself, a connection opened one second before its token expired would
+// keep delivering for as long as the process lived.
+//
+// The close code matters as much as the close: 4401 tells the client "get a
+// new token and reconnect", which is a different instruction from "this server
+// is going away".
+func TestSocketIsClosedWhenItsTokenExpires(t *testing.T) {
+	h := New()
+	go h.Run()
+	t.Cleanup(h.Close)
+
+	srv := serveHub(t, h, time.Now().Add(200*time.Millisecond))
+	conn := dial(t, srv)
+
+	_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	_, _, err := conn.ReadMessage()
+	if err == nil {
+		t.Fatal("the socket was still delivering after its token expired")
+	}
+	if !websocket.IsCloseError(err, CloseTokenExpired) {
+		t.Fatalf("close: got %v, want close code %d", err, CloseTokenExpired)
+	}
+
+	waitFor(t, time.Second, "the hub to forget the expired socket", func() bool { return h.Open() == 0 })
+	if got := h.Expired(); got != 1 {
+		t.Fatalf("expired count: got %d, want 1", got)
+	}
+}
+
+// A token that is already dead at the handshake closes the socket at once. The
+// server refuses such a token before the upgrade, so this only happens to a
+// clock that jumped — but "wait for a deadline in the past" must not mean
+// "wait forever".
+func TestAnAlreadyExpiredTokenClosesTheSocketAtOnce(t *testing.T) {
+	h := New()
+	go h.Run()
+	t.Cleanup(h.Close)
+
+	srv := serveHub(t, h, time.Now().Add(-time.Minute))
+	conn := dial(t, srv)
+
+	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if _, _, err := conn.ReadMessage(); !websocket.IsCloseError(err, CloseTokenExpired) {
+		t.Fatalf("close: got %v, want close code %d", err, CloseTokenExpired)
+	}
+}
+
 // The opposite case, and the one that must not be a false alarm: a client that
 // is idle but healthy answers the pings, so it stays connected.
 func TestAnAnsweringClientStaysConnected(t *testing.T) {
@@ -95,7 +145,7 @@ func TestAnAnsweringClientStaysConnected(t *testing.T) {
 	go h.Run()
 	t.Cleanup(h.Close)
 
-	srv := serveHub(t, h)
+	srv := serveHub(t, h, time.Time{})
 	conn := dial(t, srv)
 
 	// Reading is what answers a ping: gorilla replies with a pong from inside

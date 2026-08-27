@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -59,6 +60,9 @@ func (f *fakeDB) Health() map[string]string {
 	return map[string]string{"status": "up", "message": "It's healthy"}
 }
 
+// PoolStats has nothing to report: this fake is a map, not a connection pool.
+func (f *fakeDB) PoolStats() sql.DBStats { return sql.DBStats{} }
+
 func (f *fakeDB) Migrate(context.Context) error { return nil }
 
 func (f *fakeDB) CreateUser(_ context.Context, username, passwordHash string) (*database.User, error) {
@@ -92,6 +96,16 @@ func (f *fakeDB) Close() error { return nil }
 
 func newTestServer(t *testing.T) (*Server, *gin.Engine, *fakeDB) {
 	t.Helper()
+	// The zero rateLimits means "use the real defaults", which is what the rest
+	// of the tests want: high enough to stay out of their way, and still the
+	// same code path production runs.
+	return newTestServerWith(t, rateLimits{})
+}
+
+// newTestServerWith is newTestServer with the rate limits chosen, so a test can
+// use a limit tight enough to hit on purpose.
+func newTestServerWith(t *testing.T, limits rateLimits) (*Server, *gin.Engine, *fakeDB) {
+	t.Helper()
 	gin.SetMode(gin.TestMode)
 	db := newFakeDB()
 
@@ -102,17 +116,28 @@ func newTestServer(t *testing.T) (*Server, *gin.Engine, *fakeDB) {
 	go hub.Run()
 	t.Cleanup(hub.Close)
 
-	s := &Server{port: 8080, db: db, jwtKey: []byte("test-secret"), hub: hub}
+	s := &Server{port: 8080, db: db, jwtKey: []byte("test-secret"), hub: hub, limits: limits}
 	return s, s.RegisterRoutes(), db
 }
 
 func do(t *testing.T, r *gin.Engine, method, path, body, authHeader string) *httptest.ResponseRecorder {
 	t.Helper()
-	req := httptest.NewRequest(method, path, strings.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
+	req := httpRequest(method, path, body)
 	if authHeader != "" {
 		req.Header.Set("Authorization", authHeader)
 	}
+	return serve(r, req)
+}
+
+// httpRequest builds the request do would send, for a test that has to set a
+// header do does not know about.
+func httpRequest(method, path, body string) *http.Request {
+	req := httptest.NewRequest(method, path, strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	return req
+}
+
+func serve(r *gin.Engine, req *http.Request) *httptest.ResponseRecorder {
 	rr := httptest.NewRecorder()
 	r.ServeHTTP(rr, req)
 	return rr

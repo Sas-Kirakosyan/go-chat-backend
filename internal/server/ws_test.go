@@ -12,6 +12,8 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/gorilla/websocket"
+
+	"go-chat-backend/internal/ws"
 )
 
 // These tests use a real listening server and a real WebSocket client. The
@@ -364,15 +366,12 @@ func TestSendStillWorksAfterTheHubIsClosed(t *testing.T) {
 // ---------------------------------------------------------------------------
 // What happens to a live socket when the credential behind it dies?
 //
-// The token is checked once, during the handshake, and never again. These two
-// tests exist to say out loud what that means, and to notice the day it
-// changes. They are not asserting that the behaviour is right — they are
-// pinning down what it is.
+// The token is still checked only once, at the handshake — but the socket now
+// carries the token's expiry with it and closes at that moment. These three
+// tests fence in what that does and does not fix.
 // ---------------------------------------------------------------------------
 
-// The other half of the picture: an expired token cannot OPEN a socket. Put
-// next to the test below, the two say exactly where the check happens — at the
-// handshake, and only there.
+// An expired token cannot OPEN a socket.
 func TestWSRejectsAnExpiredToken(t *testing.T) {
 	srv, s, r := newWSTestServer(t)
 	_, aliceID := signUp(t, r, "alice")
@@ -388,12 +387,17 @@ func TestWSRejectsAnExpiredToken(t *testing.T) {
 	}
 }
 
-// A socket opened with a valid token keeps working after that token expires.
-func TestSocketOutlivesItsExpiredToken(t *testing.T) {
+// A socket dies with the token that opened it.
+//
+// This is the Stage 2 fix, end to end over a real socket: the client is not
+// merely stopped from receiving, it is told why. Close code 4401 means "your
+// login ran out, get a new token", which a client can act on — unlike a
+// connection that simply goes quiet.
+func TestSocketClosesWhenItsTokenExpires(t *testing.T) {
 	srv, s, r := newWSTestServer(t)
-	alice, aliceID := signUp(t, r, "alice")
+	_, aliceID := signUp(t, r, "alice")
 	bob, bobID := signUp(t, r, "bob")
-	room := createRoom(t, r, alice, bobID)
+	room := createRoom(t, r, "Bearer "+signTokenExpiringIn(t, s, aliceID, "alice", time.Minute), bobID)
 
 	// A token with a one-second life, so the test does not wait 15 minutes.
 	short := signTokenExpiringIn(t, s, aliceID, "alice", time.Second)
@@ -410,33 +414,42 @@ func TestSocketOutlivesItsExpiredToken(t *testing.T) {
 		t.Fatalf("first frame: got %q, want \"connected\"", frame.Type)
 	}
 
-	time.Sleep(1500 * time.Millisecond)
+	// The close frame arrives on its own, without anybody sending anything.
+	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	if _, _, err := conn.ReadMessage(); !websocket.IsCloseError(err, ws.CloseTokenExpired) {
+		t.Fatalf("close: got %v, want close code %d", err, ws.CloseTokenExpired)
+	}
 
-	// Prove the token really is dead before drawing any conclusion from the
-	// socket. Without this the test could pass for the wrong reason.
+	// Prove the token really is dead, so the close above cannot be read as bad
+	// luck with the timing.
 	if rr := do(t, r, "GET", "/auth/profile", "", "Bearer "+short); rr.Code != http.StatusUnauthorized {
 		t.Fatalf("the token has not expired yet: /auth/profile answered %d", rr.Code)
 	}
 
+	// And nothing is delivered to it any more. The connection is gone, so the
+	// read gives the close error back again instead of a message frame.
 	path := fmt.Sprintf("/conversations/%d/messages", room)
 	if rr := do(t, r, "POST", path, `{"content":"after expiry"}`, bob); rr.Code != http.StatusCreated {
 		t.Fatalf("send: got %d (body %s)", rr.Code, rr.Body)
 	}
 
-	// The socket is still being served, with a credential REST now refuses.
-	frame := readFrame(t, conn)
-	if frame.Type != wsMessageEvent {
-		t.Fatalf("type: got %q, want %q", frame.Type, wsMessageEvent)
-	}
-	var msg messageDTO
-	decode(t, frame.Data, &msg)
-	if msg.Content != "after expiry" {
-		t.Fatalf("pushed message: got %+v", msg)
+	_ = conn.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
+	if _, raw, err := conn.ReadMessage(); err == nil {
+		t.Fatalf("a frame arrived on a socket that was closed: %s", raw)
 	}
 }
 
-// A socket keeps working after the user logs out.
-func TestSocketOutlivesLogout(t *testing.T) {
+// Logout is still not instant for a socket — but the gap is now bounded.
+//
+// Ending a session stops new access tokens being minted; it does not reach
+// inside a connection that is already open. So this socket keeps delivering,
+// and it will go on doing so until the access token behind it expires, which
+// is at most the 15 minutes REST already lives with.
+//
+// Closing that last gap means a revocation check on every use, which is the
+// database lookup a stateless access token exists to avoid. It is a trade,
+// written down rather than hidden.
+func TestSocketOutlivesLogoutUntilTheTokenExpires(t *testing.T) {
 	srv, _, r := newWSTestServer(t)
 	aliceToken, aliceCookie := loginFor(t, r, "alice")
 	bob, bobID := signUp(t, r, "bob")

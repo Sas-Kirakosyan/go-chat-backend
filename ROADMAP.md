@@ -83,6 +83,13 @@ network on one client without closing the socket.
 
 ## Stage 2 — Make it observable and safe
 
+**Status:** done. Logging and middleware in
+[`internal/server/logging.go`](internal/server/logging.go), metrics in
+[`internal/metrics`](internal/metrics), the limiter in
+[`internal/server/ratelimit.go`](internal/server/ratelimit.go), the probes in
+[`internal/server/health.go`](internal/server/health.go). Measured numbers are
+in the README.
+
 One node still, but now you can see inside it.
 
 - Structured logs with `log/slog`.
@@ -93,13 +100,31 @@ One node still, but now you can see inside it.
   different questions.
 - Rate limiting per user.
 - Panic recovery that logs and keeps the process up.
-- **Close a socket whose token has died.** Stage 1 checks the token only at the
-  handshake, so an open socket survives both expiry and logout — proved by
-  `TestSocketOutlivesItsExpiredToken` and `TestSocketOutlivesLogout`. Decide
-  between re-checking on a timer and closing at the known expiry time.
+- **Close a socket whose token has died.** Stage 1 checked the token only at
+  the handshake, so an open socket survived both expiry and logout. Closing at
+  the known expiry won over re-checking on a timer: `exp` is already inside the
+  token, so one timer per socket needs no clock in the read loop and no
+  database.
 
 **Learn:** how to answer "how do you know your service is healthy?" — and how
 to prove it instead of guessing.
+
+**What broke, and what it taught:**
+
+- The rate limiter broke the load tool, twice. 80 of 100 logins were refused —
+  exactly the burst got through. Teaching `cmd/wsload` to honour `Retry-After`
+  fixed that, and then 68 of 100 *sockets* failed instead.
+- The second failure was a design bug, not a tooling one. `/ws` was wearing the
+  login limit, which is low because bcrypt is deliberately expensive; a
+  handshake only parses a JWT. Moving it to the API limit connected 100 of 100.
+  An office behind one NAT address would have hit exactly the same wall.
+- A serial attacker never trips the limit at all: 40 `curl` logins one after
+  another ran at 5.6/s, right at the refill rate, because bcrypt was already
+  throttling them. The limit is what catches the *parallel* attacker — 28 of 60
+  refused at 20 in parallel.
+- Switching to structured logs removed the reason `/ws` had to be left out of
+  the request log: the new logger writes `URL.Path` and never the query string,
+  so the token cannot reach the file.
 
 **Size:** about 1 week.
 
@@ -117,6 +142,10 @@ watch it before you fix it. This is the moment the project becomes distributed.
   node fans out to its own local sockets only.
 - Add presence (who is online) in Redis, with a TTL and a heartbeat, so a node
   that dies does not leave ghosts online forever.
+- Set `SetTrustedProxies` to the nginx address. Until there is a proxy, gin
+  trusts every `X-Forwarded-For`, so the Stage 2 rate limit can be dodged by a
+  client that simply claims another IP. The fix needs an address to trust, and
+  this is the stage that creates one.
 
 **Learn:** why in-process state does not scale, sticky sessions, shared state,
 what happens when the shared thing goes down.
@@ -239,7 +268,7 @@ worked on one.
 
 - [x] Stage 0 — Graceful shutdown
 - [x] Stage 1 — WebSocket delivery, one node
-- [ ] Stage 2 — Observability and safety
+- [x] Stage 2 — Observability and safety
 - [ ] Stage 3 — Two nodes, Redis Pub/Sub, presence
 - [ ] Stage 4 — Delivery guarantees
 - [ ] Stage 5 — Outbox and a broker

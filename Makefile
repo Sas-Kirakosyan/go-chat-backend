@@ -58,14 +58,61 @@ docker-run:
 docker-down:
 	@docker compose down
 
-# Test the application
+# ---------------------------------------------------------------------------
+# Tests
+#
+# -count=1 is on every target on purpose. Go caches test results, so a second
+# run prints "(cached)" and tests nothing. That cache is helpful in a big CI
+# job and misleading on a laptop, where you re-run a test exactly because you
+# just changed something.
+#
+# Docker must be running for the database tests: they start a real Postgres
+# with testcontainers. Without it they fail with "cannot connect to the Docker
+# API", which is the environment talking, not your code.
+# ---------------------------------------------------------------------------
+
+# Everything, quietly. One line per package. This is the one to use.
 test:
 	@echo "Testing..."
-	@go test ./... -v
-# Integrations Tests for the application
+	@go test -count=1 ./...
+
+# Everything, loudly: every test name and everything the server logged.
+# Useful when a test fails and you want to see why.
+test-v:
+	@go test -count=1 -v ./...
+
+# One test, or a group. The name is a regular expression:
+#
+#   make test-one NAME=TestSocketClosesWhenItsTokenExpires
+#   make test-one NAME=TestRateLimit                        # every test starting with it
+#   make test-one NAME=TestBucket PKG=./internal/server     # and only in one package
+#
+# Add PKG when you know where the test lives. Without it every package is
+# opened, and internal/database starts a Postgres container before finding it
+# has nothing to run — three wasted seconds on every attempt.
+PKG ?= ./...
+test-one:
+	@go test -count=1 -v -run "$(NAME)" $(PKG)
+
+# The database tests only. They are the slow ones, and the ones that need Docker.
 itest:
 	@echo "Running integration tests..."
-	@go test ./internal/database -v -count=1
+	@go test -count=1 -v ./internal/database
+
+# The race detector: it finds two goroutines touching the same memory at once.
+# This project runs two goroutines per socket, so it is the most valuable test
+# command here — and the one most likely to fail to start.
+#
+# It needs cgo and a C compiler. Without gcc on PATH it stops with
+# "-race requires cgo". Install TDM-GCC or MinGW-w64 to get it working.
+test-race:
+	@CGO_ENABLED=1 go test -count=1 -race ./...
+
+# Which lines the tests actually run. Opens a coloured report in the browser:
+# green is covered, red is not.
+cover:
+	@go test -count=1 -coverprofile=coverage.out ./...
+	@go tool cover -html=coverage.out
 
 # Clean the binary
 clean:
@@ -84,5 +131,6 @@ watch:
 		Write-Output 'Watching...'; \
 	}"
 
-.PHONY: all build run seed wsload test clean watch docker-run docker-down itest \
+.PHONY: all build run seed wsload clean watch docker-run docker-down \
+	test test-v test-one test-race itest cover \
 	migrate-status migrate-up migrate-down migration

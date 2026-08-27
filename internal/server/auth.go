@@ -139,9 +139,15 @@ func (s *Server) parseAccessToken(tokenStr string) (*Claims, error) {
 
 	// WithValidMethods pins HS256. Without it a forged token could name "none"
 	// as its algorithm and be accepted with no signature at all.
+	//
+	// WithExpirationRequired refuses a token with no exp claim at all. The
+	// library checks exp only when it is present, so without this a token that
+	// simply left it out would never expire. Every token we mint has one, and
+	// the WebSocket now closes a socket at that time, so "there is always an
+	// exp" has to be a rule and not a habit.
 	token, err := jwt.ParseWithClaims(tokenStr, claims, func(t *jwt.Token) (interface{}, error) {
 		return s.jwtKey, nil
-	}, jwt.WithValidMethods([]string{jwt.SigningMethodHS256.Alg()}))
+	}, jwt.WithValidMethods([]string{jwt.SigningMethodHS256.Alg()}), jwt.WithExpirationRequired())
 
 	if err != nil || !token.Valid {
 		return nil, errInvalidToken

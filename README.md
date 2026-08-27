@@ -8,16 +8,21 @@ CORS is configured for a frontend on `http://localhost:5173`.
 
 ## Status
 
-Authentication with refresh-token sessions, the conversation REST API, and the
-WebSocket delivery layer are implemented and tested. Delivery runs on a single
-node: a second instance would not see the first one's sockets. That is the next
-stage.
+Authentication with refresh-token sessions, the conversation REST API, the
+WebSocket delivery layer, and the observability and safety work around them are
+implemented and tested.
+
+Delivery still runs on a single node: a second instance would not see the first
+one's sockets. That is the next stage.
 
 ## Endpoints
 
 | Method | Path                          | Auth   | Description                                 |
 | ------ | ----------------------------- | ------ | ------------------------------------------- |
+| `GET`  | `/livez`                      | no     | Is the process alive? Restart it if not     |
+| `GET`  | `/readyz`                     | no     | Should this node be sent traffic right now? |
 | `GET`  | `/health`                     | no     | Database connectivity and pool stats        |
+| `GET`  | `/metrics`                    | no     | Prometheus metrics                          |
 | `GET`  | `/ws`                         | query  | Live delivery socket (see below)            |
 | `POST` | `/register`                   | no     | Create an account                           |
 | `POST` | `/login`                      | no     | Exchange credentials for a JWT + session    |
@@ -193,36 +198,50 @@ logs, and sometimes to a `Referer`. It is accepted on this one route and
 nowhere else, and the access token lives 15 minutes. Widening it to every route
 would trade a small, bounded leak for a large one.
 
-Our own log is the part we control, so `/ws` is left out of gin's request
-logger — otherwise the server would write a live token to disk on every
-connect. That is why `RegisterRoutes` builds the middleware by hand instead of
-calling `gin.Default()`.
+Our own log is the part we control, and the rule there is simple: **the query
+string is never logged.** Gin's own logger prints path and query together,
+which would write a live token to disk on every connect — one of the reasons
+`RegisterRoutes` builds the middleware by hand instead of calling
+`gin.Default()`. Ours logs `URL.Path` and nothing else, so `/ws` is logged like
+any other route and the token never reaches the file. There is a test that
+fails if that ever changes.
 
-### The socket outlives its token — a known gap
+### The socket dies with its token
 
-The token is checked **once**, at the handshake, and never again. After the
-upgrade nothing looks at it. Two consequences, both confirmed by tests in
-[`ws_test.go`](internal/server/ws_test.go):
+The token is checked **once**, at the handshake. Rather than re-check it, the
+socket carries the token's own `exp` and closes at that moment:
 
 | | Result |
 | --- | --- |
 | Dial with an expired token | refused, `401` (`TestWSRejectsAnExpiredToken`) |
-| Token expires **while** a socket is open | messages keep arriving (`TestSocketOutlivesItsExpiredToken`) |
-| User logs out while a socket is open | messages keep arriving (`TestSocketOutlivesLogout`) |
+| Token expires **while** a socket is open | closed with code **4401**, `"token expired"` |
+| User logs out while a socket is open | keeps delivering, until the token expires |
 
-Both tests first prove the credential is really dead — `/auth/profile` answers
-`401`, `/auth/refresh` answers `401` — and only then check the socket. So this
-is the server's behaviour, not a test that passed for the wrong reason.
+Close code 4401 is in the range reserved for the application, and echoes HTTP
+401 on purpose: it tells a client *get a new token and reconnect*, which is a
+different instruction from `1001 going away` (*the server is stopping, come
+back later*). Without the distinction a client cannot tell a deploy from an
+expired login, and would reconnect forever with the same dead token.
 
-It is a small hole in the promise the session design makes. Logout is already
-documented as taking up to 15 minutes to bite, because the access token is
-stateless; a socket stretches that from 15 minutes to *forever*, or until the
-process restarts.
+**Why a deadline and not a re-check.** The other options were a timer that
+re-parses the token, or a session lookup in the database every so often. Both
+put a clock — and one of them a query — inside the socket's own goroutine,
+times five thousand sockets, to learn something already known: `exp` is inside
+the token, so the moment it dies is known at connect time. One timer per
+socket, no database, no polling.
 
-It is left open for now on purpose — closing it means either re-checking the
-token on a timer, which puts a clock in the read loop, or having the client
-close its own socket at expiry, which is not a defence. The fix belongs with
-the rest of the safety work in Stage 2.
+**What it does not fix.** Logout is still not instant for a socket. Ending a
+session stops new access tokens being minted; it does not reach inside a
+connection that is already open. The gap is now *bounded* by the token's life
+instead of being unbounded — a socket is no worse than a REST call with the
+same token, which is the 15-minute window the session design already accepts.
+Closing it completely means a revocation check on every use, which is the exact
+database lookup a stateless access token exists to avoid.
+
+Every row above is a test in [`ws_test.go`](internal/server/ws_test.go), and
+each one first proves the credential is really dead — `/auth/profile` answers
+`401`, `/auth/refresh` answers `401` — before drawing any conclusion from the
+socket.
 
 ### CORS does not protect a socket
 
@@ -331,6 +350,255 @@ queue overflowing, and the kernel refusing what will not fit. The load tool now
 dials 64 at a time and retries with backoff, which is what a real client does
 anyway.
 
+## Seeing inside it
+
+One node, but now you can watch it work: structured logs with a request id,
+Prometheus metrics, and health endpoints that answer different questions.
+
+### The logs are structured
+
+Every line is key/value pairs, written by `log/slog`. JSON in production,
+because a log shipper wants JSON; plain text when `APP_ENV=local`, because a
+person watching a terminal does not.
+
+```
+level=INFO msg="request" request_id=a1b2c3 method=POST path=/conversations/7/messages status=201 duration_ms=4.2 bytes=133 ip=10.0.0.4 user_id=12
+level=INFO msg="ws connected" request_id=d4e5f6 user_id=12 expires_in_s=899
+level=WARN msg="rate limited" request_id=99aa88 scope=auth path=/login retry_after_s=1
+```
+
+"A request was slow" is a sentence a human reads one of. `status=500
+route=/login` is something a machine can count, filter and alert on. Once there
+is more than one node, reading logs by eye stops working, and this is what
+replaces it.
+
+`slog.SetDefault` also redirects the old `log` package, so a stray `log.Printf`
+anywhere in the tree comes out in the same format instead of bypassing all of
+this.
+
+The level follows the status: 5xx is `ERROR`, 4xx is `WARN`, everything else is
+`INFO`. So "show me the failures" is a filter, not a grep for words.
+
+**Quiet when healthy, loud when not.** `/livez`, `/readyz` and `/metrics` are
+asked by machines every few seconds. They are not logged while they answer
+`2xx` — and they are logged like everything else the moment they do not,
+because a probe that starts failing is one of the most interesting lines in the
+file.
+
+### One id per request
+
+Every request gets a 16-character id. It goes on every log line the request
+writes, and back to the caller in `X-Request-Id`, so a user who reports a
+failed call gives you the exact rows to look at.
+
+An id sent by a proxy is reused, so a trace that started at the edge is not cut
+in half here — but it is **checked first**. It arrives from the network and
+goes straight into a log line, and a caller who could put a newline in it would
+be writing our logs for us: one crafted header and a convincing fake `request
+status=200` line appears in the file, which is how an audit trail stops being
+evidence. Only short strings of letters, digits, `-`, `_` and `.` are accepted;
+anything else is replaced with one of ours.
+
+In Stage 5 and 6 the same id will follow a message into a broker and into
+another service.
+
+### Metrics
+
+`GET /metrics` in the Prometheus text format.
+
+| Metric | Type | What it answers |
+| ------ | ---- | --------------- |
+| `chat_http_requests_total{method,route,status}` | counter | throughput, and the error rate as `status=~"5.."` |
+| `chat_http_request_duration_seconds{method,route}` | histogram | p50/p95/p99 latency |
+| `chat_http_requests_in_flight` | gauge | requests being served right now |
+| `chat_messages_stored_total` | counter | the real write rate |
+| `chat_ws_connections_open` | gauge | sockets on this node |
+| `chat_ws_frames_sent_total` | counter | fan-out volume — one message to 50 people counts 50 |
+| `chat_ws_clients_dropped_total` | counter | sockets dropped for reading too slowly |
+| `chat_ws_broadcasts_shed_total` | counter | fan-outs thrown away because the hub was behind |
+| `chat_ws_sockets_expired_total` | counter | sockets closed because their token ran out |
+| `chat_rate_limited_total{scope}` | counter | requests refused with 429 |
+| `chat_panics_recovered_total` | counter | should be flat at zero |
+| `chat_db_pool_*` | gauges + counters | the pool that Stage 1 found was the real bottleneck |
+
+The Go runtime and process collectors come free with the default registry.
+`go_goroutines` is the one to watch here: this service runs **two goroutines
+per socket**, so a leak shows up there before it shows up anywhere else.
+
+**Labels are the part that is easy to get wrong.** Prometheus stores one time
+series per unique label combination, so a label whose value comes from the
+caller is a memory leak with an open door in front of it. The HTTP metrics are
+therefore labelled with the *route template*:
+
+```
+chat_http_requests_total{method="POST",route="/conversations/:id/messages",status="201"} 400
+```
+
+Ten thousand rooms are one series, not ten thousand. Anything unrouted — a
+scanner asking for `/wp-login.php`, `/.env`, and whatever it tries next — is
+labelled `other`, because the path is chosen by a stranger and our series names
+must not be. Both rules have a test.
+
+The Stage 1 finding is now a graph rather than a lucky glance at `/health`:
+
+```
+chat_db_pool_waits_total 44
+chat_db_pool_wait_seconds_total 0.331
+chat_db_pool_open_connections 25
+chat_db_pool_max_open_connections 25
+```
+
+Waits climbing while `open_connections` sits at the maximum *is* the picture of
+a message queueing for a database handle.
+
+To look at it as graphs:
+
+```bash
+docker compose --profile observability up -d
+# Prometheus on http://localhost:9090
+```
+
+`/metrics` is open because everything here runs on one machine. On a cluster it
+belongs on the internal network only: the numbers say how many people are
+online and how the service is coping, which is not something to hand to the
+internet.
+
+### Three endpoints, three questions
+
+|  |  |
+| --- | --- |
+| `/livez` | Is this process alive? **Restart me if not.** |
+| `/readyz` | Should traffic come to me right now? **Take me out if not.** |
+| `/health` | What is going on in there? For a person. |
+
+Mixing the first two is the classic mistake, and it is expensive. If liveness
+checked the database, then a database outage would make Kubernetes kill every
+API pod, over and over, in a restart loop — and not one of those restarts would
+help, because the broken thing is the database. The pods were fine.
+
+Split, the behaviour is right: the database goes down, `/readyz` starts
+failing, the nodes are taken out of the load balancer, nothing is restarted,
+and when the database comes back they are put in again on their own.
+
+`/livez` deliberately checks nothing. Its answer arriving *is* the check: the
+process is up, the accept loop works, and a goroutine got scheduled to write
+it.
+
+`/readyz` also fails at the **start** of shutdown, before the drain, so a load
+balancer stops sending new requests to a node that is about to close. Without
+that, every deploy drops a handful of requests into a dying process. Liveness
+stays true throughout — the process is alive, it is just not taking new work,
+and failing liveness there would ask the platform to `SIGKILL` a clean
+shutdown.
+
+## Staying up
+
+### A panic does not take the node down
+
+A panic in one handler would otherwise kill the process, and with it every
+other request in flight and every open socket. One nil map in one rare branch
+must not be able to do that. The recovery middleware logs the panic with its
+stack and the request id, counts it in `chat_panics_recovered_total`, and
+answers `500`.
+
+The stack is logged, never returned: a stack trace in a response body hands a
+stranger the file layout and library versions of the server.
+
+A *broken pipe* is treated differently — that is the client hanging up
+mid-response, not a bug in us. The connection is already gone, so writing a 500
+into it would only panic a second time.
+
+### Rate limits
+
+Two limiters, because the two groups of routes are attacked in completely
+different ways.
+
+| | Key | Default | Guards |
+| --- | --- | --- | --- |
+| `auth` | client IP | 5/s, burst 20 | `/register`, `/login`, `/auth/refresh`, `/auth/logout` |
+| `api` | user id | 20/s, burst 40 | everything behind the access token |
+| `api` | client IP | 20/s, burst 40 | `/ws` — nobody has proved who they are yet |
+
+`/login` is guessed at: a thousand passwords against one account, or one
+password against a thousand accounts. There is no user id yet — that is the
+part being guessed — so the only key available is the address, and the limit is
+low because a real person logs in a handful of times a day.
+
+Behind `AuthMiddleware` the caller is known, so the key is the user id and one
+noisy client cannot spend the allowance of everyone else in the same office.
+The limit is higher because a chat client legitimately bursts: opening the app
+fires a room list plus history for the room you were last in.
+
+Each caller gets a **token bucket**: it holds `burst` tokens, refills at `rate`
+per second, and a request costs one. It is a number and a timestamp, not a
+timer, so a caller that goes quiet costs nothing until it comes back. A fixed
+window ("100 per minute") was the alternative and is worse: it lets a client
+spend everything in the last second of one window and again in the first second
+of the next.
+
+Idle buckets are swept once a minute. Without that the map grows by one entry
+per address that ever arrived, which is a slow memory leak an attacker can
+steer by rotating IPs. A *full* bucket is identical to no bucket at all — a new
+caller starts full — so deleting it takes nothing away from anyone.
+
+A refused request gets `429` and a `Retry-After` in whole seconds, never zero,
+because a client told to wait zero comes straight back.
+
+The probes are not limited at all. A refused probe looks exactly like a dead
+node, so the monitoring would take a healthy server out of service.
+
+**One caveat worth knowing.** `c.ClientIP()` reads `X-Forwarded-For`, and gin
+trusts every proxy by default, so a client can currently claim any address it
+likes. This is a speed bump against a plain script, not a defence against a
+determined attacker. The fix is `SetTrustedProxies` with the real proxy's
+address, and that address is only known once there is an nginx in front — Stage
+3.
+
+For a load test, raise the limits rather than adding a back door that skips
+them; a server with the limiter disabled is not the server that ships:
+
+```bash
+RATE_LIMIT_AUTH_RPS=2000 RATE_LIMIT_API_RPS=5000 make run
+```
+
+### Measured
+
+| Case | Result |
+| ---- | ------ |
+| 40 wrong-password logins, one at a time with `curl` | **0 refused** — 7.1 s for 40, which is 5.6/s |
+| 60 wrong-password logins, 20 in parallel | **28 refused**, `Retry-After: 1`, in 2.7 s |
+| `chat_rate_limited_total{scope="auth"}` after that | 28, matching the 28 `status="429"` rows |
+| 1000 sockets, limits raised, 20 msg/room | 1000/1000 connected in **206 ms**, p50 **6 ms**, p99 **206 ms**, 20 000 frames, 0 shed |
+| Same run, pool pressure | 44 waits totalling **0.33 s** |
+
+**A serial attacker never trips the limit — and does not need to.** Forty
+attempts through one `curl` at a time took 7.1 seconds, which is 5.6 per
+second, right at the refill rate. The thing throttling it was not the limiter:
+it was bcrypt, deliberately slow, costing about 90 ms of server CPU per
+attempt. The rate limit is what catches the *parallel* attacker, and against 20
+at once it refused 28 of 60.
+
+**The safety feature broke the tooling, twice.** `cmd/wsload` is one machine
+pretending to be a thousand people, so it is the first thing the limiter
+punishes:
+
+1. 80 of 100 logins failed with `429`. Exactly 20 got through — the burst.
+2. Teaching the tool to honour `Retry-After` fixed the logins, and then 68 of
+   100 **sockets** failed instead. The handshake was wearing the login limit,
+   which exists because bcrypt is expensive; a handshake only parses a JWT and
+   costs microseconds. `/ws` was moved to the API limit, and the same run then
+   connected 100 of 100.
+
+The second one is the more useful bug: an office behind one NAT address would
+have seen exactly what the load tool saw. Charging a cheap route the price of
+an expensive one is a limit that looks fine until real users share an address.
+
+The fix on the client side is what a real client does anyway — back off for as
+long as the server asked, double the wait each attempt, and add jitter. Jitter
+matters as much as the wait: every caller was refused by the same bucket at the
+same moment, so returning after exactly one second sends them all back
+together.
+
 ## Shutdown
 
 `SIGINT` or `SIGTERM` starts an orderly stop, and the order matters:
@@ -409,7 +677,21 @@ BLUEPRINT_DB_SCHEMA=public
 ```
 
 `JWT_SECRET` is required — the server refuses to start without it. Setting
-`APP_ENV=local` echoes every SQL statement to the log.
+`APP_ENV=local` echoes every SQL statement to the log, and prints logs as plain
+text instead of JSON.
+
+Everything else is optional and has a working default:
+
+| Variable | Default | What it does |
+| -------- | ------- | ------------ |
+| `LOG_LEVEL` | `info` | `debug`, `info`, `warn`, `error` |
+| `RATE_LIMIT_AUTH_RPS` | `5` | logins and registrations per second, per IP |
+| `RATE_LIMIT_AUTH_BURST` | `20` | how many may arrive at once |
+| `RATE_LIMIT_API_RPS` | `20` | authenticated requests per second, per user |
+| `RATE_LIMIT_API_BURST` | `40` | how many may arrive at once |
+
+The limits are configurable because a limit that fits real users does not fit a
+load test — see [Rate limits](#rate-limits).
 
 ## Migrations
 
@@ -535,7 +817,7 @@ Live reload the application:
 make watch
 ```
 
-Run the test suite:
+Run the tests (see [Testing](#testing) for the whole list):
 ```bash
 make test
 ```
@@ -553,5 +835,29 @@ make migrate-down
 make migration NAME=add_read_receipts
 ```
 
-The database tests use [testcontainers](https://testcontainers.com/) and need a
-running Docker daemon.
+## Testing
+
+| Command | What it runs |
+| ------- | ------------ |
+| `make test` | Everything, quietly. One line per package. **Start here.** |
+| `make test-v` | Everything, loudly: every test name, and everything the server logged |
+| `make test-one NAME=TestX` | One test, or every test whose name matches. Add `PKG=./internal/server` to look in one package only |
+| `make itest` | Only the database tests — the slow ones |
+| `make test-race` | Everything, with the race detector |
+| `make cover` | Which lines the tests reach, as a coloured page in your browser |
+
+Every one of them passes `-count=1`. Go caches test results, so without it a
+second run prints `(cached)` and tests nothing — helpful in CI, misleading on a
+laptop, where you re-run a test exactly *because* you just changed something.
+
+**Docker must be running** for the database tests. They start a real Postgres
+with [testcontainers](https://testcontainers.com/), so without a Docker daemon
+they stop with `cannot connect to the Docker API`. That is the environment
+talking, not the code. The rest of the suite needs nothing.
+
+**`make test-race` is the valuable one here, and the one most likely to refuse
+to start.** It finds two goroutines touching the same memory at the same
+moment, which is the bug this project can have — there are two goroutines per
+socket, and Stage 3 adds more. It needs cgo and a C compiler, and stops with
+`-race requires cgo` when there is no `gcc` on `PATH`. On Windows,
+[TDM-GCC](https://jmeubank.github.io/tdm-gcc/) or MinGW-w64 fixes that.

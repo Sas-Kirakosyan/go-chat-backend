@@ -1,13 +1,37 @@
 package server
 
 import (
+	"log/slog"
 	"net/http"
+	"os"
+	"strings"
 
 	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
 
 	"go-chat-backend/internal/metrics"
 )
+
+// trustedProxies reads TRUSTED_PROXIES: a comma separated list of addresses or
+// CIDR ranges that sit in front of this node.
+//
+// In compose it is the Docker bridge network, because that is where nginx is.
+// An empty result means no proxy is trusted at all, which is the safe default:
+// a forged header is then simply ignored.
+func trustedProxies() []string {
+	raw := strings.TrimSpace(os.Getenv("TRUSTED_PROXIES"))
+	if raw == "" {
+		return nil
+	}
+
+	var out []string
+	for _, p := range strings.Split(raw, ",") {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
 
 //which URL goes to which function
 
@@ -28,6 +52,23 @@ func (s *Server) RegisterRoutes() *gin.Engine {
 	//                      status recovery set
 	//  4. recovery         nearest the handlers, which is where panics come from
 	r := gin.New()
+
+	// Whose X-Forwarded-For do we believe?
+	//
+	// gin trusts every proxy by default, which means it trusts every client:
+	// anyone may send "X-Forwarded-For: 1.2.3.4" and the per-IP rate limit from
+	// Stage 2 then counts a different caller on every request. The limit was
+	// real, and one header walked around it.
+	//
+	// The fix needs an address to trust, and Stage 3 is what created one. With
+	// TRUSTED_PROXIES unset the list is empty, which means "trust nobody": the
+	// client IP is the TCP address, and headers are ignored. That is the right
+	// answer when the server is reached directly, as it is in `make run`.
+	if err := r.SetTrustedProxies(trustedProxies()); err != nil {
+		slog.Error("bad TRUSTED_PROXIES, trusting no proxy", "err", err)
+		_ = r.SetTrustedProxies(nil)
+	}
+
 	r.Use(observeRequests())
 	r.Use(s.requestID())
 	r.Use(s.requestLogger())
@@ -117,6 +158,7 @@ func (s *Server) RegisterRoutes() *gin.Engine {
 		conversations.POST("/:id/members", s.AddMemberHandler)
 		conversations.POST("/:id/messages", s.SendMessageHandler)
 		conversations.GET("/:id/messages", s.ListMessagesHandler)
+		conversations.GET("/:id/presence", s.PresenceHandler)
 	}
 
 	return r

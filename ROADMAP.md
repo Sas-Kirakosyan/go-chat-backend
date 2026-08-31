@@ -132,6 +132,11 @@ to prove it instead of guessing.
 
 ## Stage 3 — Two nodes: the first real distributed problem
 
+**Status:** done. nginx and the two nodes are in
+[`docker-compose.yml`](docker-compose.yml) and [`nginx.conf`](nginx.conf), the
+Redis fan-out and presence in [`internal/cluster`](internal/cluster), and the
+proof in [`cmd/splitcheck`](cmd/splitcheck). Measured numbers are in the README.
+
 Run two API instances behind nginx.
 
 **It breaks.** User A is connected to node 1, user B to node 2. B never sees the
@@ -153,6 +158,33 @@ what happens when the shared thing goes down.
 **Break it:** stop Redis while both nodes run. What still works? Sends should
 still succeed and history should still read. Only live delivery should stop.
 Write down what you saw.
+
+**What broke, and what it taught:**
+
+- The bug was real and it was worse through nginx than through the node ports.
+  Round robin decides where each socket lands, so the same command failed
+  differently on every run — once both sockets landed on one node and the
+  message went to the other, and nobody received it at all.
+- Stopping Redis found three bugs that thinking about it had not. A presence
+  request **hung for over 15 seconds**, because the handler had no deadline of
+  its own and go-redis retries. Every send took **2.009 s**, which was the
+  publish timeout — the timeout was not protecting the write path, it was the
+  write path's problem.
+- The third was the worst. The node pinged Redis at startup and exited if it
+  failed, so restarting the nodes during the outage put them in a **crash
+  loop**: a Redis outage had become a total outage, for a service that is
+  supposed to lose only its live push. The same reasoning is why `/readyz` does
+  not check Redis — a shared dependency in a readiness probe takes every node
+  out at once.
+- Recovery needs no restart, but only because the subscriber retries in a loop.
+  go-redis reconnects a subscription it already had; it can do nothing about a
+  subscribe that never succeeded, which is exactly a node that started while
+  Redis was down. Such a node would have run forever, storing messages and
+  pushing none.
+- Presence had to be a timer, not an event. The one moment a node cannot send
+  "my users left" is the moment it is killed — and with `docker compose kill`,
+  the dead node's user fell out of the online list **30 seconds** later, exactly
+  one TTL, with no goodbye from anyone.
 
 **Size:** about 2 weeks.
 
@@ -269,7 +301,7 @@ worked on one.
 - [x] Stage 0 — Graceful shutdown
 - [x] Stage 1 — WebSocket delivery, one node
 - [x] Stage 2 — Observability and safety
-- [ ] Stage 3 — Two nodes, Redis Pub/Sub, presence
+- [x] Stage 3 — Two nodes, Redis Pub/Sub, presence
 - [ ] Stage 4 — Delivery guarantees
 - [ ] Stage 5 — Outbox and a broker
 - [ ] Stage 6 — A second service over gRPC

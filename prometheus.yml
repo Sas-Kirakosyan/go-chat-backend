@@ -15,6 +15,11 @@ global:
 scrape_configs:
   - job_name: chat-api
     static_configs:
-      # The compose service name, on its own network. Not localhost: inside a
-      # container that would be the Prometheus container itself.
-      - targets: ["api:8080"]
+      # The compose service names, on their own network. Not localhost: inside
+      # a container that would be the Prometheus container itself.
+      #
+      # Both nodes are scraped separately, and each series keeps an `instance`
+      # label saying which one it came from. That is the point from Stage 3 on:
+      # "500 sockets are open" is not a useful number if it is really 500 on one
+      # node and 0 on the other.
+      - targets: ["api1:8080", "api2:8080"]

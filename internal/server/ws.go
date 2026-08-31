@@ -127,7 +127,8 @@ func wsAccessToken(c *gin.Context) (string, bool) {
 	return "", false
 }
 
-// broadcastMessage pushes a stored message to every member of its room.
+// broadcastMessage pushes a stored message to every member of its room,
+// wherever in the cluster they are connected.
 //
 // It is best effort, on purpose. The message is already committed to Postgres
 // and the sender already has its 201; a delivery that fails here is a missed
@@ -149,5 +150,19 @@ func (s *Server) broadcastMessage(c *gin.Context, conversationID uint, msg messa
 		return
 	}
 
-	s.hub.Broadcast(memberIDs, payload)
+	// Single node: straight to the local hub, as in Stage 2.
+	if s.cluster == nil {
+		s.hub.Broadcast(memberIDs, payload)
+		return
+	}
+
+	// Cluster: publish and stop. This node does NOT also deliver locally — it
+	// will receive its own message back through the subscription, like every
+	// other node. One path in means a member on this node cannot get the
+	// message twice, and it means the delivery code is exercised on every
+	// message rather than only on the ones that cross a node boundary.
+	if err := s.cluster.Publish(c.Request.Context(), memberIDs, payload); err != nil {
+		logFrom(c).Error("cluster could not publish message",
+			"message_id", msg.ID, "conversation_id", conversationID, "err", err)
+	}
 }

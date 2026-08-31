@@ -38,6 +38,11 @@ type Hub struct {
 	unregister chan *Client
 	broadcast  chan envelope
 
+	// snapshot is how another goroutine asks "which users do you hold?" without
+	// touching the client map. The asker sends a reply channel; run() answers on
+	// it. Stage 3's presence heartbeat is the caller.
+	snapshot chan chan []uint
+
 	// done is closed by Close. It tells run() to stop and tells Broadcast
 	// there is nobody left to deliver to.
 	done chan struct{}
@@ -86,6 +91,7 @@ func New() *Hub {
 		register:   make(chan *Client),
 		unregister: make(chan *Client),
 		broadcast:  make(chan envelope, broadcastBuffer),
+		snapshot:   make(chan chan []uint),
 		done:       make(chan struct{}),
 		stopped:    make(chan struct{}),
 		clients:    make(map[uint]map[*Client]struct{}),
@@ -111,6 +117,9 @@ func (h *Hub) Run() {
 
 		case e := <-h.broadcast:
 			h.deliver(e)
+
+		case reply := <-h.snapshot:
+			reply <- h.localUserIDs()
 
 		case <-h.done:
 			h.closeAll()
@@ -194,6 +203,28 @@ func (h *Hub) Close() {
 	<-h.stopped
 }
 
+// UserIDs is every user with at least one socket on this node.
+//
+// One user with three tabs appears once: the caller is the presence heartbeat,
+// and "online" is about a person, not a socket.
+//
+// It asks run() instead of reading the map, because run() owns the map. A
+// mutex here would be a second way to touch the same state, and two rules for
+// one piece of state is how races are born.
+func (h *Hub) UserIDs() []uint {
+	// Buffered, so run() can answer and move on even if this caller is slow.
+	reply := make(chan []uint, 1)
+
+	select {
+	case h.snapshot <- reply:
+		return <-reply
+	case <-h.done:
+		// Shutting down. Nobody is online here any more, and saying so is the
+		// truthful answer, not an error.
+		return nil
+	}
+}
+
 // Open is how many sockets are connected right now.
 func (h *Hub) Open() int { return int(h.open.Load()) }
 
@@ -248,6 +279,15 @@ func (h *Hub) remove(c *Client) {
 	}
 	close(c.send)
 	h.open.Add(-1)
+}
+
+// localUserIDs lists the users this node holds. Run on the run() goroutine.
+func (h *Hub) localUserIDs() []uint {
+	ids := make([]uint, 0, len(h.clients))
+	for userID := range h.clients {
+		ids = append(ids, userID)
+	}
+	return ids
 }
 
 // deliver fans one payload out to the local sockets of the listed users.

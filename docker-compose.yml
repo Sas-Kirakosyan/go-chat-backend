@@ -1,3 +1,51 @@
+# Stage 3 turns this file into a small cluster: one database, two API nodes,
+# and nginx in front of them.
+#
+#   docker compose up --build            database + api1 + api2 + nginx
+#   docker compose --profile observability up -d   ... and Prometheus
+#
+# Ports:
+#   8080  nginx, the address a client should use
+#   8081  api1 directly
+#   8082  api2 directly
+#
+# The two node ports are not how a client is meant to connect. They exist so a
+# test can say "put this socket on that node" and prove what each node does or
+# does not know. cmd/splitcheck uses them.
+
+# Everything both API nodes share. YAML anchors keep it in one place, so the
+# two services differ only in the ways they are supposed to differ.
+x-api: &api
+  build: .
+  restart: unless-stopped
+  depends_on:
+    psql_bp:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+  environment: &api-env
+    PORT: 8080
+    APP_ENV: production
+    JWT_SECRET: ${JWT_SECRET}
+    # Compose gives every service a DNS name on the shared network, so the
+    # host here is the service name rather than localhost. Inside the
+    # network Postgres is on its real port, 5432, not the 5433 published
+    # to the host.
+    BLUEPRINT_DB_HOST: psql_bp
+    BLUEPRINT_DB_PORT: 5432
+    BLUEPRINT_DB_DATABASE: ${BLUEPRINT_DB_DATABASE}
+    BLUEPRINT_DB_USERNAME: ${BLUEPRINT_DB_USERNAME}
+    BLUEPRINT_DB_PASSWORD: ${BLUEPRINT_DB_PASSWORD}
+    BLUEPRINT_DB_SCHEMA: ${BLUEPRINT_DB_SCHEMA}
+    # gin believes X-Forwarded-For only from an address named here. Without
+    # it, any client could claim another IP and walk around the per-IP rate
+    # limit by sending one header.
+    TRUSTED_PROXIES: ${TRUSTED_PROXIES:-172.16.0.0/12}
+    # The one setting that turns single-node mode into cluster mode. Unset it
+    # and a node still runs, still stores messages, and still pushes to its own
+    # sockets — it simply stops hearing about anyone else's.
+    REDIS_ADDR: redis:6379
+
 services:
   psql_bp:
     image: postgres:18
@@ -7,10 +55,16 @@ services:
       POSTGRES_USER: ${BLUEPRINT_DB_USERNAME}
       POSTGRES_PASSWORD: ${BLUEPRINT_DB_PASSWORD}
     ports:
-      # Host 5433, not 5432: the PostgreSQL 17 installed natively on this
-      # machine already holds 5432, and two processes cannot bind one port.
+      # Host 5434, not 5432 and not 5433. This machine runs PostgreSQL
+      # natively, and it holds both of those: 5432 for the main instance and
+      # 5433 for a second one. 5433 was worse than a plain conflict — Docker
+      # took the IPv6 address and the native server kept IPv4, so a host tool
+      # connecting to "localhost:5433" reached one or the other depending on
+      # which address family it picked, and the error was a password failure
+      # rather than anything about the wrong server.
+      #
       # Inside the compose network the container is still reached on 5432.
-      - "5433:5432"
+      - "5434:5432"
     volumes:
       # Postgres 18 moved the data dir convention: the mount belongs at
       # /var/lib/postgresql, and PGDATA becomes a versioned subdirectory of it.
@@ -27,31 +81,61 @@ services:
       retries: 10
       start_period: 5s
 
-  api:
-    build: .
+  redis:
+    image: redis:8.2-alpine
+    restart: unless-stopped
+    # No volume, and that is on purpose. Nothing here is worth keeping: Pub/Sub
+    # stores nothing at all, and presence is a claim about right now that is
+    # stale within 30 seconds. Every fact that must survive a restart is in
+    # Postgres. Giving Redis a disk would only invite someone to put something
+    # important in it.
+    #
+    # Published on 6380, not 6379, in case a Redis is already running natively
+    # on this machine — the same trap the database port fell into.
+    ports:
+      - "6380:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+      start_period: 2s
+
+  # Two nodes, not `deploy: replicas: 2`. Replicas share one name and one set
+  # of published ports, and this stage needs to reach each node on purpose.
+  #
+  # Both run migrations at startup and that is safe: goose takes a Postgres
+  # advisory lock (see internal/database/migrate.go), so the loser waits
+  # instead of applying the same file twice.
+  api1:
+    <<: *api
+    environment:
+      <<: *api-env
+      NODE_ID: api1
+    ports:
+      - "8081:8080"
+
+  api2:
+    <<: *api
+    environment:
+      <<: *api-env
+      NODE_ID: api2
+    ports:
+      - "8082:8080"
+
+  nginx:
+    image: nginx:1.29-alpine
     restart: unless-stopped
     depends_on:
-      psql_bp:
-        condition: service_healthy
-    environment:
-      PORT: 8080
-      APP_ENV: production
-      JWT_SECRET: ${JWT_SECRET}
-      # Compose gives every service a DNS name on the shared network, so the
-      # host here is the service name rather than localhost. Inside the
-      # network Postgres is on its real port, 5432, not the 5433 published
-      # to the host.
-      BLUEPRINT_DB_HOST: psql_bp
-      BLUEPRINT_DB_PORT: 5432
-      BLUEPRINT_DB_DATABASE: ${BLUEPRINT_DB_DATABASE}
-      BLUEPRINT_DB_USERNAME: ${BLUEPRINT_DB_USERNAME}
-      BLUEPRINT_DB_PASSWORD: ${BLUEPRINT_DB_PASSWORD}
-      BLUEPRINT_DB_SCHEMA: ${BLUEPRINT_DB_SCHEMA}
+      - api1
+      - api2
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
     ports:
-      - "8080:8080"
+      - "8080:80"
 
-  # Not started by default. `docker compose up` should stay a database and an
-  # API; watching graphs is a thing you ask for:
+  # Not started by default. `docker compose up` should stay a database, the
+  # nodes and the proxy; watching graphs is a thing you ask for:
   #
   #   docker compose --profile observability up -d
   #
@@ -61,7 +145,8 @@ services:
     image: prom/prometheus:v3.1.0
     profiles: ["observability"]
     depends_on:
-      - api
+      - api1
+      - api2
     volumes:
       - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
     ports:

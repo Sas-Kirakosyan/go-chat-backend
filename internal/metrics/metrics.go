@@ -157,6 +157,57 @@ func RegisterWebSocket(s WSStats) {
 	}, func() float64 { return float64(s.Expired()) }))
 }
 
+// ClusterStats is what the metrics package needs from the Redis layer.
+type ClusterStats interface {
+	Published() int
+	Received() int
+	PublishFailed() int
+	PresenceFailed() int
+	Subscribed() bool
+}
+
+// RegisterCluster publishes the cross-node fan-out counters.
+//
+// The pair worth watching is published against received. On a healthy cluster
+// every node receives every message, so summed across N nodes, received should
+// be about N times published. If received stops rising while published keeps
+// going, this node's subscription is dead and its sockets have gone quiet —
+// which is invisible in the HTTP metrics, because sends are still returning
+// 201.
+func RegisterCluster(s ClusterStats) {
+	counter := func(name, help string, read func() float64) {
+		register(prometheus.NewCounterFunc(prometheus.CounterOpts{
+			Namespace: namespace,
+			Subsystem: "cluster",
+			Name:      name,
+			Help:      help,
+		}, read))
+	}
+
+	counter("fanouts_published_total", "Fan-outs this node published to Redis.",
+		func() float64 { return float64(s.Published()) })
+	counter("fanouts_received_total", "Fan-outs this node received from Redis, its own included.",
+		func() float64 { return float64(s.Received()) })
+	counter("publish_failures_total", "Fan-outs that could not be published. Each one is a message nobody was pushed.",
+		func() float64 { return float64(s.PublishFailed()) })
+	counter("presence_failures_total", "Presence heartbeats that failed. Enough in a row and this node's users look offline.",
+		func() float64 { return float64(s.PresenceFailed()) })
+
+	// The one to alert on. A node at 0 is storing messages and pushing none of
+	// them, and nothing in the HTTP metrics shows it: sends still answer 201.
+	register(prometheus.NewGaugeFunc(prometheus.GaugeOpts{
+		Namespace: namespace,
+		Subsystem: "cluster",
+		Name:      "subscribed",
+		Help:      "1 when this node holds its Redis subscription, 0 when it does not and its sockets are silent.",
+	}, func() float64 {
+		if s.Subscribed() {
+			return 1
+		}
+		return 0
+	}))
+}
+
 // PoolStats is what the metrics package needs from the database layer.
 type PoolStats interface {
 	PoolStats() sql.DBStats

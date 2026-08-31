@@ -12,8 +12,12 @@ Authentication with refresh-token sessions, the conversation REST API, the
 WebSocket delivery layer, and the observability and safety work around them are
 implemented and tested.
 
-Delivery still runs on a single node: a second instance would not see the first
-one's sockets. That is the next stage.
+Delivery now runs across **two nodes behind nginx**, joined by Redis Pub/Sub,
+with presence in Redis and a per-node view on `/metrics`. Stopping Redis costs
+the live push and nothing else — see [Two nodes](#two-nodes).
+
+Still missing: a message can be lost while a client reconnects. Sequence
+numbers and gap recovery are the next stage.
 
 ## Endpoints
 
@@ -34,6 +38,7 @@ one's sockets. That is the next stage.
 | `POST` | `/conversations/:id/members`  | bearer | Add someone to a room                       |
 | `POST` | `/conversations/:id/messages` | bearer | Send a message                              |
 | `GET`  | `/conversations/:id/messages` | bearer | History, newest first, keyset paginated     |
+| `GET`  | `/conversations/:id/presence` | bearer | Who in the room is online, cluster-wide     |
 
 Tokens are HS256, valid for 15 minutes, and sent as `Authorization: Bearer <token>`.
 The token carries the user id as well as the name, so a room handler does not
@@ -599,6 +604,173 @@ matters as much as the wait: every caller was refused by the same bucket at the
 same moment, so returning after exactly one second sends them all back
 together.
 
+## Two nodes
+
+One node is a program. Two nodes is a system, and the difference shows up in
+the first minute.
+
+Run two API instances behind nginx and the chat breaks. User A is connected to
+node 1, user B to node 2. A sends a message; B never sees it. Nothing errors —
+the message is committed to Postgres, the sender gets a 201, and history shows
+it on both nodes. Only the live push is missing, because node 1's hub knows
+node 1's sockets and nothing else.
+
+[`cmd/splitcheck`](cmd/splitcheck) puts two members of one room on two named
+nodes and asks the only question that matters:
+
+```bash
+docker compose up --build -d
+make splitcheck
+```
+
+Before the fix:
+
+```
+A sends on node A
+  socket on localhost:8081  received it
+  socket on localhost:8082  NOTHING after 3s
+
+B sends on node B
+  socket on localhost:8081  NOTHING after 3s
+  socket on localhost:8082  received it
+```
+
+Through nginx it is worse, not better: round robin decides where each socket
+lands, so the same command fails differently on every run. Once, both sockets
+landed on one node and the message went to the other, and **nobody** received
+it. A bug that changes shape each time is the one that survives a whole sprint.
+
+### Redis Pub/Sub, and one delivery path
+
+The fix is in [`internal/cluster`](internal/cluster). The write path publishes
+to one Redis channel; every node subscribes and fans out to its own local
+sockets only. The hub does not change at all — Redis plugs in beside it, which
+is what the Stage 1 note in [`internal/ws`](internal/ws) was written for.
+
+The decision worth defending: **a node does not deliver its own message
+locally.** It publishes, and then receives it back through the subscription
+like every other node. One path in, so a member on the sending node cannot get
+the message twice, and the cross-node path is exercised by every single message
+rather than only by the ones that happen to cross a boundary.
+
+The counters say it worked. After two messages, one sent on each node:
+
+| Metric | api1 | api2 |
+| ------ | ---- | ---- |
+| `chat_cluster_fanouts_published_total` | 1 | 1 |
+| `chat_cluster_fanouts_received_total` | 2 | 2 |
+| `chat_ws_frames_sent_total` | 2 | 2 |
+
+Two published, four received (both nodes hear both), and two frames per node —
+one per message, per socket. No duplicates.
+
+One channel for the whole system, not one per room. A channel per room would
+mean subscribing and unsubscribing as people come and go, and a node holding
+sockets in 5000 rooms would carry 5000 subscriptions. Every node reading
+everything is more traffic and far less bookkeeping, and the filter is cheap: a
+node drops any fan-out whose users it does not hold.
+
+### Presence, and why it is a timer
+
+`GET /conversations/:id/presence` answers who in a room is online, anywhere in
+the cluster. It is a Redis sorted set: member `userID:nodeID`, score the unix
+time that node last saw them. Online means "score newer than 30 seconds ago".
+
+Everything about that shape is chosen for one case — **a node that dies without
+saying goodbye**:
+
+- The score, not a TTL per key, because one key holds the whole cluster and a
+  room of fifty is one command instead of fifty.
+- `userID:nodeID`, not `userID`, because a phone on node 1 and a laptop on node
+  2 are two entries. As one entry, the node that lost the user would erase the
+  node that still has them.
+- Written on a **timer**, not when a socket opens or closes. Events are cheaper
+  and would be wrong: the one moment a node cannot send an event is the moment
+  it is killed.
+
+Which is exactly the test. Hold two sockets open, kill the node one of them is
+on, and watch from the survivor:
+
+```bash
+make splitcheck ARGS="-hold 60s"
+docker compose kill api1      # in another terminal
+```
+
+```
+  + 50s  node B says: user A online, user B online
+  + 55s  node B says: user A OFFLINE, user B online
+```
+
+Nobody told Redis that user A had gone. Their entry simply stopped being
+refreshed and fell out of the 30-second window on its own.
+
+### Trusted proxies
+
+Putting nginx in front created a hole that had to be closed in the same stage.
+Gin trusts every proxy by default, which means it trusts every client: anyone
+could send `X-Forwarded-For: 1.2.3.4` and the per-IP rate limit from Stage 2
+would count a brand new caller on every request. `TRUSTED_PROXIES` names the
+addresses whose header is believed. Unset, it means *trust nobody* — the client
+IP is the TCP address — which is the right answer for `make run`.
+
+### Measured: what happens when Redis stops
+
+The interesting run is the failure one. Both nodes up, `docker compose stop
+redis`, then measure every path.
+
+| Path | Redis up | Redis down |
+| ---- | -------- | ---------- |
+| `POST /conversations/:id/messages` | 201 in **8 ms** | 201 in **510 ms** |
+| `GET /conversations/:id/messages` | 200 in **5 ms** | 200 in **5 ms** |
+| `GET /conversations/:id/presence` | 200 in **6 ms** | **503** in 1.0 s |
+| `GET /readyz` | 200 | **200** |
+| Live delivery | both nodes | **none** |
+
+Sends still succeed, history is untouched, the nodes stay in the load balancer,
+and only the live push stops. That is the shape a degraded chat should have.
+
+Three things had to be fixed to get there, and all three were found by running
+this, not by thinking about it.
+
+**Presence hung for over 15 seconds.** With Redis stopped, the handler waited
+on a dead dependency until the *client* gave up. The per-connection timeouts
+were not enough — go-redis retries, and a DNS lookup for a container that no
+longer exists is slow by itself, so the waits stack. Any handler that touches a
+shared service needs its own deadline. One second, and presence now fails fast
+with a 503.
+
+**Every send took 2.009 seconds.** That was the publish timeout, and the
+timeout was not protecting the write path — it *was* the write path's problem.
+It is 500 ms now: far above a healthy publish, and survivable during an outage.
+Publishing in a goroutine would make the POST instant and is the wrong answer,
+because two messages sent in order could reach Redis out of order. A chat that
+reorders lines is broken in a way a slow one is not.
+
+**The nodes crash-looped.** The first version pinged Redis at startup and
+called `os.Exit` if it failed. With Redis down, restarting the nodes put them
+in a restart loop: exit 1, restart, fail, exit 1. A Redis outage had become a
+total outage — no login, no history, no sending — for a service that is
+supposed to lose only its live push. Now it logs one line and starts anyway.
+
+That last one is the same rule as `/readyz`, which deliberately does **not**
+check Redis. Redis is shared by every node, so a Redis outage would fail the
+probe on all of them at once and the load balancer would take the whole service
+out. A shared dependency in a readiness probe turns one broken thing into an
+outage. `/health` reports `redis: down` for the human, and the status code
+stays 200.
+
+Recovery needs no restart. `docker compose start redis`, and within a few
+seconds both nodes report `chat_cluster_subscribed 1` and `make splitcheck`
+passes again. That works because the subscriber retries in a loop:
+`go-redis` reconnects a subscription it already had, but it can do nothing
+about a subscribe that never succeeded — which is exactly a node that started
+during the outage. Without the retry loop such a node would run forever, taking
+messages and never pushing one.
+
+`chat_cluster_subscribed` is the metric to alert on. A node stuck at 0 is
+storing messages and pushing none of them, and nothing in the HTTP metrics
+shows it: every send still answers 201.
+
 ## Shutdown
 
 `SIGINT` or `SIGTERM` starts an orderly stop, and the order matters:
@@ -689,6 +861,13 @@ Everything else is optional and has a working default:
 | `RATE_LIMIT_AUTH_BURST` | `20` | how many may arrive at once |
 | `RATE_LIMIT_API_RPS` | `20` | authenticated requests per second, per user |
 | `RATE_LIMIT_API_BURST` | `40` | how many may arrive at once |
+| `REDIS_ADDR` | unset | `host:port` of Redis. Unset means single-node: messages still reach this node's own sockets, and no others |
+| `REDIS_PASSWORD` | unset | only if your Redis needs one |
+| `NODE_ID` | hostname | the name this node uses in its logs and in presence |
+| `TRUSTED_PROXIES` | unset | addresses or CIDRs whose `X-Forwarded-For` is believed. Unset means trust nobody |
+
+`REDIS_ADDR` is the switch between one node and many. Compose sets it; `make
+run` does not, so local development needs no Redis at all.
 
 The limits are configurable because a limit that fits real users does not fit a
 load test — see [Rate limits](#rate-limits).
@@ -764,9 +943,10 @@ If you are coming from an older checkout, `make run` is enough: goose adopts the
 existing tables and brings them up to date. `make migrate-status` shows you what
 it will do before you run it.
 
-The `api` service in `docker-compose.yml` ships the same binary. It migrates on
-startup too, so after pulling schema changes rebuild it rather than only
-restarting it:
+The two `api` services in `docker-compose.yml` ship the same binary. They
+migrate on startup too — safely, both at once, because goose takes a Postgres
+advisory lock — so after pulling schema changes rebuild them rather than only
+restarting them:
 
 ```bash
 docker compose up --build -d
@@ -774,6 +954,33 @@ docker compose up --build -d
 
 A stale container is worth avoiding: it still holds the old code, and old code
 migrates the database its old way.
+
+### The cluster
+
+`docker compose up` starts Postgres, Redis, two API nodes and nginx:
+
+| Address | What |
+| ------- | ---- |
+| `localhost:8080` | nginx — the address a client should use |
+| `localhost:8081` | `api1` directly |
+| `localhost:8082` | `api2` directly |
+| `localhost:5434` | Postgres |
+| `localhost:6380` | Redis |
+
+The two node ports are not how a client is meant to connect. They exist so a
+test can say "put this socket on that node", which is what `make splitcheck`
+does. The database and Redis are published on unusual ports on purpose: a
+natively installed Postgres or Redis takes the normal one, and the failure that
+causes is nasty — on this machine, Docker held `5433` on IPv6 while a native
+Postgres held it on IPv4, so a host tool reached one or the other depending on
+which address family it picked, and reported a wrong password.
+
+The container database is its own database. To seed it, point the tool at the
+published port:
+
+```bash
+BLUEPRINT_DB_HOST=127.0.0.1 BLUEPRINT_DB_PORT=5434 make seed ARGS="-n 2"
+```
 
 ## MakeFile
 
@@ -810,6 +1017,12 @@ Load test the WebSocket hub against a running server (seed the users first):
 ```bash
 make seed ARGS="-n 5000"
 make wsload ARGS="-n 5000 -messages 20"
+```
+
+Check that two nodes share their fan-out (start the cluster first):
+```bash
+make splitcheck
+make splitcheck ARGS="-hold 60s"    # then kill a node and watch presence
 ```
 
 Live reload the application:

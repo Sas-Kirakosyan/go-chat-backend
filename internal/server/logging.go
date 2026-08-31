@@ -55,6 +55,15 @@ func setupLogging() *slog.Logger {
 	}
 
 	logger := slog.New(handler)
+
+	// NODE_ID says which process wrote the line. With one node it is noise;
+	// with two behind nginx it is the first thing you need, because "the socket
+	// never got the message" and "this node never had the socket" look the same
+	// in a log that cannot tell the nodes apart.
+	if node := os.Getenv("NODE_ID"); node != "" {
+		logger = logger.With("node", node)
+	}
+
 	slog.SetDefault(logger)
 	return logger
 }

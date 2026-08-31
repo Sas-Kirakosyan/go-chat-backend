@@ -25,6 +25,17 @@ seed:
 wsload:
 	@go run ./cmd/wsload $(ARGS)
 
+# Stage 3: prove whether two API nodes share their fan-out.
+#
+# It puts two members of one room on two different nodes and sends a message.
+# Before Redis Pub/Sub only the sender's node delivers, and the tool says so.
+#
+#   docker compose up --build -d
+#   make seed ARGS="-n 2"
+#   make splitcheck
+splitcheck:
+	@go run ./cmd/splitcheck $(ARGS)
+
 # Migrations. The server applies them itself on startup; these are for looking
 # before you leap, and for stepping back after a mistake.
 migrate-status:
@@ -131,6 +142,6 @@ watch:
 		Write-Output 'Watching...'; \
 	}"
 
-.PHONY: all build run seed wsload clean watch docker-run docker-down \
+.PHONY: all build run seed wsload splitcheck clean watch docker-run docker-down \
 	test test-v test-one test-race itest cover \
 	migrate-status migrate-up migrate-down migration

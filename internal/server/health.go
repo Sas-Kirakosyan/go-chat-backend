@@ -41,6 +41,14 @@ func (s *Server) livezHandler(c *gin.Context) {
 //     deploy drops a handful of requests into a dying process.
 //  2. The database is unreachable. Nearly every route needs it, so answering
 //     them here would only produce 500s.
+//
+// Redis is deliberately NOT checked, even though Stage 3 made live delivery
+// depend on it. Redis is shared by every node, so a Redis outage would fail
+// this probe on all of them at once, the load balancer would take the whole
+// service out, and users would lose login, history and sending — none of which
+// need Redis. A shared dependency in a readiness probe turns one broken thing
+// into a total outage. Live delivery degrades instead, and /health below says
+// so.
 func (s *Server) readyzHandler(c *gin.Context) {
 	if s.draining.Load() {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"status": "shutting down"})
@@ -61,9 +69,26 @@ func (s *Server) readyzHandler(c *gin.Context) {
 // so they can be graphed over time instead of read once.
 func (s *Server) healthHandler(c *gin.Context) {
 	stats := s.db.Health()
+
+	// Redis appears here and nowhere else. This is the page a person opens when
+	// "my friend on the other node sees nothing", and redis:"down" answers that
+	// question in one line. It does not change the status code: the node is
+	// serving fine, it just cannot reach the other nodes.
+	stats["redis"] = s.redisStatus(c)
+
 	if stats["status"] != "up" {
 		c.JSON(http.StatusServiceUnavailable, stats)
 		return
 	}
 	c.JSON(http.StatusOK, stats)
+}
+
+func (s *Server) redisStatus(c *gin.Context) string {
+	if s.cluster == nil {
+		return "not configured (single node)"
+	}
+	if err := s.cluster.Ping(c.Request.Context()); err != nil {
+		return "down: " + err.Error()
+	}
+	return "up"
 }

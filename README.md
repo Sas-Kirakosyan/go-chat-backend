@@ -16,8 +16,14 @@ Delivery now runs across **two nodes behind nginx**, joined by Redis Pub/Sub,
 with presence in Redis and a per-node view on `/metrics`. Stopping Redis costs
 the live push and nothing else — see [Two nodes](#two-nodes).
 
-Still missing: a message can be lost while a client reconnects. Sequence
-numbers and gap recovery are the next stage.
+Every message now carries a **per-room sequence number**, so a client that
+loses its socket can see exactly what it missed and ask for it. Delivery is
+at-least-once: a message may arrive twice, never zero times — see
+[Delivery guarantees](#delivery-guarantees).
+
+Still missing: the handler writes to Postgres and then publishes to Redis. If
+it dies between the two, the message exists and nobody is told until someone
+asks for a gap. That dual write is the next stage.
 
 ## Endpoints
 
@@ -37,10 +43,12 @@ numbers and gap recovery are the next stage.
 | `GET`  | `/conversations`              | bearer | Rooms I am a member of                      |
 | `POST` | `/conversations/:id/members`  | bearer | Add someone to a room                       |
 | `POST` | `/conversations/:id/messages` | bearer | Send a message                              |
-| `GET`  | `/conversations/:id/messages` | bearer | History, newest first, keyset paginated     |
+| `GET`  | `/conversations/:id/messages` | bearer | History newest first, or the gap after `?after_seq=` |
 | `GET`  | `/conversations/:id/presence` | bearer | Who in the room is online, cluster-wide     |
 
-Tokens are HS256, valid for 15 minutes, and sent as `Authorization: Bearer <token>`.
+Tokens are HS256, valid for 15 minutes by default, and sent as
+`Authorization: Bearer <token>`. Set `ACCESS_TOKEN_TTL=2h` to make development
+less tiring; production leaves it alone.
 The token carries the user id as well as the name, so a room handler does not
 need an extra `SELECT` to find out who is calling.
 
@@ -51,7 +59,7 @@ A login gives you two things with two different jobs:
 | | Access token | Refresh token |
 | --- | --- | --- |
 | What it is | HS256 JWT | 32 random bytes, base64 |
-| Lives for | 15 minutes | 7 days |
+| Lives for | 15 minutes (`ACCESS_TOKEN_TTL`) | 7 days |
 | Sent as | `Authorization: Bearer` | httpOnly cookie, path `/auth` |
 | Checked against the database | never | on every use |
 | Job | prove who you are | get a new access token |
@@ -145,14 +153,27 @@ and any member may add anyone else.
 
 ### Paging history
 
-`GET /conversations/:id/messages` returns messages newest first.
+`GET /conversations/:id/messages` serves two different reads, because both
+answer "give me messages from this room" and both need the same membership
+check.
+
+**Backwards, for a person scrolling up.** This is the default.
 
 - `?before_id=` returns only messages older than that id.
 - `?limit=` defaults to 50 and is capped at 100 rather than refused.
 - The response carries `next_before_id`: the cursor for the next, older page,
   or `null` at the start of the room.
 
-Paging on the id instead of `OFFSET` keeps the pages stable. `OFFSET` has to
+**Forwards, for a client catching up.** See
+[Delivery guarantees](#delivery-guarantees).
+
+- `?after_seq=` returns messages that came after that sequence number, **oldest
+  first**, because a client applies missed messages in the order they were sent.
+- The response carries `next_after_seq` when the gap is bigger than one page.
+- Sending both cursors at once is a `400`. They run in opposite directions, so
+  there is no single sensible answer.
+
+Paging on a cursor instead of `OFFSET` keeps the pages stable. `OFFSET` has to
 count and discard every earlier row, and a message written between two requests
 shifts the whole window, so the reader sees a line twice or misses it.
 
@@ -771,6 +792,159 @@ messages and never pushing one.
 storing messages and pushing none of them, and nothing in the HTTP metrics
 shows it: every send still answers 201.
 
+## Delivery guarantees
+
+Live push is best effort, and it always will be. A socket dies mid-message, a
+node loses its Redis subscription, a phone goes through a tunnel. The message
+is stored and the sender gets its `201`, but one screen never shows it.
+
+Before this stage that loss was **silent**. A client had no way to ask "did I
+miss anything?", because the only order was `id`, and `id` is one global
+counter shared by every room. A client that last saw id 100 and now sees id 140
+cannot tell whether 39 messages went to other rooms or 39 of its own were lost.
+
+### The sequence number
+
+Every message carries `seq`: its place in its **own** room, running 1, 2, 3
+with no holes. Now "I have 42, the server says 47" means exactly five missing
+messages.
+
+The number comes from `conversations.last_seq`, and the allocation happens in
+the same transaction as the insert:
+
+```sql
+UPDATE conversations SET last_seq = last_seq + 1 WHERE id = $1 RETURNING last_seq;
+INSERT INTO messages (..., seq) VALUES (..., $seq);
+```
+
+The `UPDATE` takes a row lock, so a second sender in the same room waits and
+cannot be handed the same number. Both statements commit together, so a crash
+in between leaves no hole. A unique index on `(conversation_id, seq)` is the
+safety net: if the allocation is ever wrong the insert fails loudly, instead of
+quietly giving two messages the same place and making one invisible.
+
+Three alternatives were rejected:
+
+| Idea | Why not |
+| ---- | ------- |
+| Use the global `id` | Has holes per room, so a client can never prove it is up to date |
+| One Postgres sequence per room | `CREATE SEQUENCE` on every new room, and it leaks numbers on rollback |
+| Redis `INCR` | Fast, but the counter and the row are two systems — the dual-write problem, one stage early |
+
+A retried `client_msg_id` uses up **no** number. The duplicate rolls the
+transaction back, which undoes the `UPDATE` too. Without that, a client
+retrying five times over a flaky connection would leave four holes behind, and
+every other client in the room would sit forever asking for messages that were
+never written.
+
+### Two dedupe keys, two directions
+
+These are easy to confuse and they solve different problems.
+
+| Key | Direction | Stops |
+| --- | --------- | ----- |
+| `client_msg_id` | client → server | a retried `POST` writing the message twice |
+| `seq` | server → client | a re-delivered push showing the line twice |
+
+Delivery is **at-least-once**. A message may arrive twice — live and again in a
+gap read — and the client drops any `seq` it already holds.
+
+### The reconnect order
+
+This is the part that is easy to get wrong, and getting it wrong opens a
+second, smaller hole that is even harder to see, because it only appears when
+the room is busy at the wrong moment.
+
+1. Open the socket **first**, and buffer every frame that arrives.
+2. Then call `?after_seq=<last seq you hold>`.
+3. Apply the gap, then apply the buffer.
+4. Drop any `seq` you already have.
+
+Fetching the gap before connecting loses everything sent between the two calls.
+`cmd/gapcheck` sends messages *while* the gap read is in flight on purpose, so
+that mistake cannot pass.
+
+### Measured
+
+`make gapcheck` breaks a socket while messages keep being sent, reconnects, and
+counts. B is disconnected for the middle five:
+
+```
+1. B is connected, A sends 3
+   seq [1 2 3], B saw 3 live
+2. B's socket is dead, A sends 5 into the dark
+   seq [4 5 6 7 8], B saw none of them
+   B's last known seq is 3
+3. B reconnects — socket first, then ?after_seq=3
+   the gap read returned seq [4 5 6 7 8]
+4. A sent 3 more while B was catching up: seq [9 10 11]
+
+  sent           11
+  seen live       6
+  recovered       5   (through ?after_seq=)
+  duplicates      0   (arrived twice, dropped by seq)
+  MISSING         0
+```
+
+The run worth doing twice is the one with Redis killed in the middle:
+
+```
+make gapcheck ARGS="-pause 30s"      # then: docker compose kill redis
+```
+
+Live push stops completely — not for one socket, for every socket on every
+node — and the numbers change shape while the verdict does not:
+
+| | Socket dropped | Redis killed |
+| --- | --- | --- |
+| sent | 11 | 11 |
+| seen live | 6 | **3** (only the ones before the kill) |
+| recovered by `?after_seq=` | 5 | **8** |
+| **missing** | **0** | **0** |
+
+That is the whole point of the stage. The transport can fail entirely, and the
+client still ends up holding every message in order, because the gap read never
+touches Redis at all — it is one indexed query against Postgres.
+
+`chat_gap_messages_total` is the metric this creates. It is the honest measure
+of how much live delivery is being missed, and nothing else shows it: a message
+that never reaches a socket is still stored, still answered with `201`, and
+still counted by `chat_messages_stored_total`. `chat_gap_size` says whether a
+rising rate is many clients missing one message each or one client that was
+away for an hour — two completely different causes.
+
+### The cost
+
+Writes into **one** room now serialise on one row lock. Different rooms never
+touch the same row, so this is a per-room ceiling and not a service-wide one.
+
+Measured at the store, 20 concurrent writers, 500 messages, no HTTP and no rate
+limiter in the way:
+
+| Where the writes go | Throughput |
+| ------------------- | ---------- |
+| One hot room | **372 writes/sec** |
+| Spread over 20 rooms | **1410 writes/sec** |
+| One hot room, repeated | 393 writes/sec |
+
+So contention on one room costs about **3.7×**, and rooms scale past it
+independently. That is the right shape for a chat: a room where twenty people
+type at the same instant is nowhere near 372 messages a second, and a service
+with thousands of rooms gets the second number, not the first.
+
+If one room ever did need more, the fix is not to drop the lock — it is to stop
+sharing a counter, and that means moving the allocation somewhere it can be
+sharded. That trade is worth making only with a real room that needs it.
+
+### What this does not fix
+
+- Redis Pub/Sub is still fire and forget. This stage lets a client *notice and
+  repair* a miss; it does not stop the miss.
+- The handler still writes Postgres and then publishes. That dual write is the
+  next stage's outbox.
+- The client has to actually ask. A client that never reconnects never learns
+  anything, and a client that ignores `seq` is exactly as broken as before.
+
 ## Shutdown
 
 `SIGINT` or `SIGTERM` starts an orderly stop, and the order matters:
@@ -857,6 +1031,7 @@ Everything else is optional and has a working default:
 | Variable | Default | What it does |
 | -------- | ------- | ------------ |
 | `LOG_LEVEL` | `info` | `debug`, `info`, `warn`, `error` |
+| `ACCESS_TOKEN_TTL` | `15m` | how long an access token lives. Longer is easier in development and worse in production: a logout only really bites once the token expires |
 | `RATE_LIMIT_AUTH_RPS` | `5` | logins and registrations per second, per IP |
 | `RATE_LIMIT_AUTH_BURST` | `20` | how many may arrive at once |
 | `RATE_LIMIT_API_RPS` | `20` | authenticated requests per second, per user |
@@ -969,7 +1144,7 @@ migrates the database its old way.
 
 The two node ports are not how a client is meant to connect. They exist so a
 test can say "put this socket on that node", which is what `make splitcheck`
-does. The database and Redis are published on unusual ports on purpose: a
+and `make gapcheck` do. The database and Redis are published on unusual ports on purpose: a
 natively installed Postgres or Redis takes the normal one, and the failure that
 causes is nasty — on this machine, Docker held `5433` on IPv6 while a native
 Postgres held it on IPv4, so a host tool reached one or the other depending on
@@ -1023,6 +1198,12 @@ Check that two nodes share their fan-out (start the cluster first):
 ```bash
 make splitcheck
 make splitcheck ARGS="-hold 60s"    # then kill a node and watch presence
+```
+
+Check that a client which loses its socket loses no messages:
+```bash
+make gapcheck
+make gapcheck ARGS="-pause 30s"     # then `docker compose kill redis`
 ```
 
 Live reload the application:

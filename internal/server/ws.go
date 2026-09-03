@@ -116,7 +116,8 @@ func (s *Server) WSHandler(c *gin.Context) {
 //
 // A token in a URL is a real cost: URLs land in access logs, in proxy logs,
 // and in a Referer header. It is accepted here and nowhere else, and the
-// access token lives 15 minutes, which is what keeps that cost small.
+// access token lives 15 minutes by default, which is what keeps that cost
+// small. Raising ACCESS_TOKEN_TTL raises this cost with it.
 func wsAccessToken(c *gin.Context) (string, bool) {
 	if token, ok := bearerToken(c.GetHeader("Authorization")); ok {
 		return token, true

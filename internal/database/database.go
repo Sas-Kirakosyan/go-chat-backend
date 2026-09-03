@@ -107,15 +107,24 @@ type Service interface {
 	// should receive the message, so it reads ids only, not whole user rows.
 	ListConversationMemberIDs(ctx context.Context, conversationID uint) ([]uint, error)
 
-	// CreateMessage stores one message. When clientMsgID is not nil and this
-	// sender already used it in this room, nothing is written: the first
-	// message comes back with created set to false.
+	// CreateMessage stores one message and gives it the next sequence number
+	// in its room. When clientMsgID is not nil and this sender already used it
+	// in this room, nothing is written and no number is used up: the first
+	// message comes back with created set to false. It returns
+	// ErrConversationNotFound if the room is gone.
 	CreateMessage(ctx context.Context, conversationID, senderID uint, content string, clientMsgID *string) (msg *Message, created bool, err error)
 
 	// ListMessages returns up to limit messages from a room, newest first,
 	// with the sender loaded. A beforeID above zero returns only messages
 	// older than that id, which is how the caller walks back through history.
 	ListMessages(ctx context.Context, conversationID, beforeID uint, limit int) ([]Message, error)
+
+	// ListMessagesAfterSeq returns up to limit messages that came after
+	// afterSeq in this room, OLDEST first, with the sender loaded. It is the
+	// gap read a client uses after reconnecting, so its direction is the
+	// opposite of ListMessages: missed messages are applied in the order they
+	// were sent.
+	ListMessagesAfterSeq(ctx context.Context, conversationID, afterSeq uint, limit int) ([]Message, error)
 
 	// Close terminates the database connection.
 	// It returns an error if the connection cannot be closed.

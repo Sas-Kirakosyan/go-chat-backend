@@ -86,6 +86,35 @@ var (
 		Help:      "Messages written to the database. A repeated client_msg_id stores nothing and is not counted.",
 	})
 
+	// GapMessages counts messages handed back through ?after_seq=, the gap
+	// read a client uses after reconnecting.
+	//
+	// This is the honest measure of how much live delivery is being missed.
+	// Nothing else shows it: a message that never reaches a socket is still
+	// stored, still answered with 201, and still counted by MessagesStored. A
+	// rising rate here means sockets are dropping, or a node has lost its Redis
+	// subscription while its HTTP metrics stayed perfectly healthy.
+	GapMessages = promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: namespace,
+		Name:      "gap_messages_total",
+		Help:      "Messages served through ?after_seq= to a client catching up after a reconnect.",
+	})
+
+	// GapSize is how many messages one gap read returned.
+	//
+	// The counter above says how much was missed in total; this says whether
+	// that is many clients missing one message each, or one client that was
+	// away for an hour. Those two have completely different causes.
+	//
+	// The buckets are hand-picked: the default histogram buckets are latency
+	// seconds and mean nothing for a message count.
+	GapSize = promauto.NewHistogram(prometheus.HistogramOpts{
+		Namespace: namespace,
+		Name:      "gap_size",
+		Help:      "Messages returned by one gap read. Zero means the client had missed nothing.",
+		Buckets:   []float64{0, 1, 5, 10, 50, 100, 500},
+	})
+
 	// RateLimited counts requests refused with 429. The scope label says which
 	// limiter refused it: "auth" (per IP) or "api" (per user).
 	RateLimited = promauto.NewCounterVec(prometheus.CounterOpts{

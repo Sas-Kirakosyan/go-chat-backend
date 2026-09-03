@@ -192,13 +192,22 @@ Write down what you saw.
 
 ## Stage 4 — Delivery guarantees
 
-Right now a message can be missed while a client reconnects.
+**Status:** done. `seq` is allocated in `CreateMessage`
+([`internal/database/conversations.go`](internal/database/conversations.go)),
+the gap read is `?after_seq=` in
+[`internal/server/conversations.go`](internal/server/conversations.go), and the
+proof tool is [`cmd/gapcheck`](cmd/gapcheck). Measured numbers are in the
+README.
 
 - Give each conversation a sequence number, so messages have an order that does
   not depend on clocks.
 - The client remembers `last_seq` and asks for the gap after reconnecting.
 - Delivery becomes at-least-once, so duplicates are possible — the existing
   `client_msg_id` unique index is already the dedupe key.
+
+What the build taught that the plan did not say: `client_msg_id` and `seq` are
+**two** dedupe keys pointing in opposite directions, and a retry must roll its
+sequence number back or it leaves a hole nobody can ever fill.
 
 **Learn:** ordering, idempotency, at-least-once versus exactly-once. This is one
 of the most common distributed-systems interview questions, and here you will
@@ -302,7 +311,7 @@ worked on one.
 - [x] Stage 1 — WebSocket delivery, one node
 - [x] Stage 2 — Observability and safety
 - [x] Stage 3 — Two nodes, Redis Pub/Sub, presence
-- [ ] Stage 4 — Delivery guarantees
+- [x] Stage 4 — Delivery guarantees
 - [ ] Stage 5 — Outbox and a broker
 - [ ] Stage 6 — A second service over gRPC
 - [ ] Stage 7 — Tracing

@@ -146,9 +146,21 @@ func (s *service) ListConversationMemberIDs(ctx context.Context, conversationID 
 	return ids, nil
 }
 
-// CreateMessage stores one message. When clientMsgID is not nil and this
-// sender already used it in this room, nothing is written: the first message
-// comes back with created set to false.
+// CreateMessage stores one message and gives it the next sequence number in
+// its room. When clientMsgID is not nil and this sender already used it in this
+// room, nothing is written and no number is used up: the first message comes
+// back with created set to false.
+//
+// The number and the row are written in one transaction on purpose.
+//
+// The UPDATE takes a lock on the conversation row, so a second sender in the
+// same room waits for it and cannot be handed the same number. Both statements
+// then commit together, so a crash in between can never leave a hole in the
+// sequence — and a hole is exactly what a reconnecting client would read as
+// "I lost a message".
+//
+// The cost is real and worth knowing: writes into ONE room are now serialised
+// on one row. Different rooms never touch the same row and are unaffected.
 func (s *service) CreateMessage(ctx context.Context, conversationID, senderID uint, content string, clientMsgID *string) (*Message, bool, error) {
 	msg := &Message{
 		ConversationID: conversationID,
@@ -157,12 +169,37 @@ func (s *service) CreateMessage(ctx context.Context, conversationID, senderID ui
 		ClientMsgID:    clientMsgID,
 	}
 
-	err := s.db.WithContext(ctx).Create(msg).Error
+	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var seq uint
+		err := tx.Raw(
+			"UPDATE conversations SET last_seq = last_seq + 1 WHERE id = ? AND deleted_at IS NULL RETURNING last_seq",
+			conversationID,
+		).Scan(&seq).Error
+		if err != nil {
+			return fmt.Errorf("allocate seq: %w", err)
+		}
+		// No row was updated, so nothing was returned and seq is still the zero
+		// value. A real allocation is always 1 or more, so this can only mean
+		// the room is gone. Callers check membership first, so it should not
+		// happen — but writing a message with seq 0 would be silent damage.
+		if seq == 0 {
+			return ErrConversationNotFound
+		}
+		msg.Seq = seq
+
+		// Returned unwrapped, so the errors.Is below can still see it.
+		return tx.Create(msg).Error
+	})
+
 	if errors.Is(err, gorm.ErrDuplicatedKey) && clientMsgID != nil {
 		// The unique index rejected the insert, so this sender already used
 		// this key in this room. That is a retry, not an error: hand back the
 		// row that got there first. The index covers sender_id, so the row is
 		// always this sender's own message.
+		//
+		// The transaction has already rolled back, which also undoes the
+		// UPDATE above. That matters: a client retrying a send five times must
+		// not burn five sequence numbers and leave four holes behind.
 		var existing Message
 		err := s.db.WithContext(ctx).
 			Where("conversation_id = ? AND sender_id = ? AND client_msg_id = ?", conversationID, senderID, *clientMsgID).
@@ -171,6 +208,9 @@ func (s *service) CreateMessage(ctx context.Context, conversationID, senderID ui
 			return nil, false, fmt.Errorf("load duplicate message: %w", err)
 		}
 		return &existing, false, nil
+	}
+	if errors.Is(err, ErrConversationNotFound) {
+		return nil, false, err
 	}
 	if err != nil {
 		return nil, false, fmt.Errorf("insert message: %w", err)
@@ -198,6 +238,32 @@ func (s *service) ListMessages(ctx context.Context, conversationID, beforeID uin
 	var msgs []Message
 	if err := q.Find(&msgs).Error; err != nil {
 		return nil, fmt.Errorf("select messages: %w", err)
+	}
+	return msgs, nil
+}
+
+// ListMessagesAfterSeq returns up to limit messages that came after afterSeq in
+// this room, OLDEST FIRST. It is the gap read: a client that reconnects says
+// which number it last saw, and gets what it missed, in the order it missed it.
+//
+// The direction is the opposite of ListMessages, and that is the point. History
+// is read backwards, one screen at a time, because a reader starts at the
+// newest line. A gap is replayed forwards, because a client applies missed
+// messages in the order they were sent.
+//
+// afterSeq of 0 means "I have nothing", so it returns the start of the room.
+// The query is a range scan on the (conversation_id, seq) unique index.
+func (s *service) ListMessagesAfterSeq(ctx context.Context, conversationID, afterSeq uint, limit int) ([]Message, error) {
+	var msgs []Message
+
+	err := s.db.WithContext(ctx).
+		Where("conversation_id = ? AND seq > ?", conversationID, afterSeq).
+		Preload("Sender").
+		Order("seq ASC").
+		Limit(limit).
+		Find(&msgs).Error
+	if err != nil {
+		return nil, fmt.Errorf("select messages after seq: %w", err)
 	}
 	return msgs, nil
 }

@@ -153,9 +153,11 @@ func (s *Server) RefreshHandler(c *gin.Context) {
 // LogoutHandler handles POST /auth/logout.
 //
 // It ends the session, so no new access token can be minted. The access token
-// the caller already holds keeps working until it expires — at most 15 more
-// minutes. That gap is the price of a stateless access token, and closing it
-// would mean a database lookup on every single request.
+// the caller already holds keeps working until it expires — at most one more
+// tokenTTL, 15 minutes by default. That gap is the price of a stateless access
+// token, and closing it would mean a database lookup on every single request.
+// It is also the real reason to keep ACCESS_TOKEN_TTL short: the longer the
+// token, the longer a logout takes to mean anything.
 func (s *Server) LogoutHandler(c *gin.Context) {
 	if token, err := c.Cookie(refreshCookie); err == nil && token != "" {
 		if err := s.db.RevokeRefreshToken(c.Request.Context(), hashRefreshToken(token)); err != nil {

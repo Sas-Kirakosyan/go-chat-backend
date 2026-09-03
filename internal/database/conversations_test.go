@@ -205,7 +205,7 @@ func TestMigrateIsVersionedAndRepeatable(t *testing.T) {
 	}
 	// Bump this when a migration is added. It is a deliberate speed bump: a
 	// new .sql file should be a conscious act, not something that slips in.
-	if want := int64(3); version != want {
+	if want := int64(4); version != want {
 		t.Fatalf("database is at version %d, want %d", version, want)
 	}
 
@@ -221,6 +221,8 @@ func TestMigrateIsVersionedAndRepeatable(t *testing.T) {
 		{&Message{}, "role", false},              // replaced by sender_id
 		{&Message{}, "sender_id", true},
 		{&Message{}, "client_msg_id", true},
+		{&Message{}, "seq", true},           // the per-room order
+		{&Conversation{}, "last_seq", true}, // and the counter that hands it out
 	} {
 		if got := m.HasColumn(c.model, c.name); got != c.want {
 			t.Errorf("column %s present = %v, want %v", c.name, got, c.want)

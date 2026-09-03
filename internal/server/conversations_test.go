@@ -123,6 +123,16 @@ func (f *fakeDB) CreateMessage(_ context.Context, conversationID, senderID uint,
 		}
 	}
 
+	// Sequence numbers come from the room, exactly as the real store takes
+	// them from conversations.last_seq. The duplicate check above returns
+	// before this point, so a retry burns no number here either — that is the
+	// behaviour the handler tests rely on.
+	conv, ok := f.conversations[conversationID]
+	if !ok {
+		return nil, false, database.ErrConversationNotFound
+	}
+	conv.LastSeq++
+
 	f.nextMsgID++
 	msg := database.Message{
 		Model:          gorm.Model{ID: f.nextMsgID, CreatedAt: time.Now()},
@@ -130,6 +140,7 @@ func (f *fakeDB) CreateMessage(_ context.Context, conversationID, senderID uint,
 		SenderID:       senderID,
 		Content:        content,
 		ClientMsgID:    clientMsgID,
+		Seq:            conv.LastSeq,
 	}
 	f.messages = append(f.messages, msg)
 	return &msg, true, nil
@@ -146,6 +157,26 @@ func (f *fakeDB) ListMessages(_ context.Context, conversationID, beforeID uint, 
 			continue
 		}
 		if beforeID > 0 && m.ID >= beforeID {
+			continue
+		}
+		m.Sender = *f.usersByID[m.SenderID]
+		out = append(out, m)
+		if len(out) == limit {
+			break
+		}
+	}
+	return out, nil
+}
+
+// ListMessagesAfterSeq walks forwards, oldest first — the opposite direction
+// to ListMessages above, which is the whole point of the gap read.
+func (f *fakeDB) ListMessagesAfterSeq(_ context.Context, conversationID, afterSeq uint, limit int) ([]database.Message, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	out := []database.Message{}
+	for _, m := range f.messages { // appended in seq order within a room
+		if m.ConversationID != conversationID || m.Seq <= afterSeq {
 			continue
 		}
 		m.Sender = *f.usersByID[m.SenderID]

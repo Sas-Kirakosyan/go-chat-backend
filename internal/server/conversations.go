@@ -43,12 +43,20 @@ type conversationDTO struct {
 }
 
 type messageDTO struct {
-	ID             uint      `json:"id"`
-	ConversationID uint      `json:"conversation_id"`
-	Sender         userDTO   `json:"sender"`
-	Content        string    `json:"content"`
-	ClientMsgID    *string   `json:"client_msg_id,omitempty"`
-	CreatedAt      time.Time `json:"created_at"`
+	ID             uint    `json:"id"`
+	ConversationID uint    `json:"conversation_id"`
+	Sender         userDTO `json:"sender"`
+	Content        string  `json:"content"`
+	ClientMsgID    *string `json:"client_msg_id,omitempty"`
+
+	// Seq is this message's place in its own room: 1, 2, 3, with no holes.
+	// A client stores the highest one it has seen per room, and hands it back
+	// as ?after_seq= when it reconnects. It is also how a client spots a frame
+	// it already has: delivery is at-least-once, so the same seq can arrive
+	// twice and the second copy must be dropped, not shown.
+	Seq uint `json:"seq"`
+
+	CreatedAt time.Time `json:"created_at"`
 }
 
 type messagePageDTO struct {
@@ -56,6 +64,10 @@ type messagePageDTO struct {
 	// NextBeforeID is the ?before_id= value for the next, older page. It is
 	// null when this page reached the start of the room.
 	NextBeforeID *uint `json:"next_before_id"`
+	// NextAfterSeq is the ?after_seq= value for the next, newer page. It is
+	// null unless the caller asked for a gap and there is more of it: a client
+	// that was away for an hour can miss more messages than one page holds.
+	NextAfterSeq *uint `json:"next_after_seq,omitempty"`
 }
 
 type createConversationRequest struct {
@@ -100,6 +112,7 @@ func toMessageDTO(m database.Message) messageDTO {
 		Sender:         userDTO{ID: m.SenderID, Username: m.Sender.Username},
 		Content:        m.Content,
 		ClientMsgID:    m.ClientMsgID,
+		Seq:            m.Seq,
 		CreatedAt:      m.CreatedAt,
 	}
 }
@@ -238,18 +251,30 @@ func (s *Server) SendMessageHandler(c *gin.Context) {
 }
 
 // ListMessagesHandler handles GET /conversations/:id/messages.
+//
+// It serves two different reads through one route, because both answer "give
+// me messages from this room" and both need the same membership check:
+//
+//   - ?before_id=  walks BACKWARDS through history, newest first. This is a
+//     person scrolling up.
+//   - ?after_seq=  walks FORWARDS through a gap, oldest first. This is a client
+//     that reconnected and is catching up.
 func (s *Server) ListMessagesHandler(c *gin.Context) {
 	conversationID, ok := s.memberOnly(c)
 	if !ok {
 		return
 	}
 
-	beforeID, limit, ok := pageParams(c)
+	q, ok := pageParams(c)
 	if !ok {
 		return
 	}
+	if q.gap {
+		s.listGap(c, conversationID, q)
+		return
+	}
 
-	msgs, err := s.db.ListMessages(c.Request.Context(), conversationID, beforeID, limit)
+	msgs, err := s.db.ListMessages(c.Request.Context(), conversationID, q.beforeID, q.limit)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Could not list messages"})
 		return
@@ -261,10 +286,45 @@ func (s *Server) ListMessagesHandler(c *gin.Context) {
 	}
 	// A full page means there is probably more behind it. The oldest id on
 	// this page is the cursor for the next one.
-	if len(msgs) == limit {
+	if len(msgs) == q.limit {
 		oldest := msgs[len(msgs)-1].ID
 		page.NextBeforeID = &oldest
 	}
+
+	c.JSON(http.StatusOK, page)
+}
+
+// listGap answers ?after_seq=: everything this client missed, oldest first.
+//
+// This is the repair path for a dropped socket. Live push is best effort — a
+// node with a dead Redis subscription, or a client whose connection died for
+// three seconds, simply does not get those frames. Before sequence numbers a
+// client could not even tell that had happened. Now it can: it remembers the
+// last seq it saw, asks for what came after, and the hole is closed.
+func (s *Server) listGap(c *gin.Context, conversationID uint, q pageQuery) {
+	msgs, err := s.db.ListMessagesAfterSeq(c.Request.Context(), conversationID, q.afterSeq, q.limit)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Could not list messages"})
+		return
+	}
+
+	page := messagePageDTO{Messages: make([]messageDTO, 0, len(msgs))}
+	for _, m := range msgs {
+		page.Messages = append(page.Messages, toMessageDTO(m))
+	}
+	// A full page means the gap is bigger than one page. The newest seq here
+	// is where the next request starts. This is not rare: a client away for an
+	// hour in a busy room misses far more than maxPageSize messages.
+	if len(msgs) == q.limit {
+		newest := msgs[len(msgs)-1].Seq
+		page.NextAfterSeq = &newest
+	}
+
+	// How much live delivery is being missed, in one number. Flat at zero means
+	// push is reaching everyone. A rising rate means sockets are dropping, or a
+	// node has lost its Redis subscription and nobody noticed.
+	metrics.GapMessages.Add(float64(len(msgs)))
+	metrics.GapSize.Observe(float64(len(msgs)))
 
 	c.JSON(http.StatusOK, page)
 }
@@ -303,26 +363,65 @@ func conversationNotFound(c *gin.Context) {
 	c.JSON(http.StatusNotFound, gin.H{"error": "Conversation not found"})
 }
 
-// pageParams reads ?before_id= and ?limit=. On failure it has already written
-// the response.
-func pageParams(c *gin.Context) (beforeID uint, limit int, ok bool) {
-	if raw := c.Query("before_id"); raw != "" {
-		v, err := strconv.ParseUint(raw, 10, 64)
-		if err != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "before_id must be a whole number"})
-			return 0, 0, false
-		}
-		beforeID = uint(v)
+// pageQuery is one parsed history request.
+type pageQuery struct {
+	// beforeID is the ?before_id= cursor: read history backwards from here.
+	beforeID uint
+
+	// afterSeq is the ?after_seq= cursor: read the gap forwards from here.
+	afterSeq uint
+
+	// gap says the caller asked for ?after_seq=. It cannot be replaced by
+	// "afterSeq > 0", because after_seq=0 is a real and useful request: it
+	// means "I have nothing yet, start me at the beginning of the room".
+	gap bool
+
+	limit int
+}
+
+// pageParams reads ?before_id=, ?after_seq= and ?limit=. On failure it has
+// already written the response.
+func pageParams(c *gin.Context) (pageQuery, bool) {
+	var q pageQuery
+
+	rawBefore := c.Query("before_id")
+	rawAfter := c.Query("after_seq")
+
+	// The two cursors run in opposite directions, so a request carrying both
+	// has no single sensible answer. Refusing is better than silently picking
+	// one and handing back a page the client did not ask for.
+	if rawBefore != "" && rawAfter != "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Use before_id or after_seq, not both"})
+		return q, false
 	}
 
-	limit = defaultPageSize
+	if rawBefore != "" {
+		v, err := strconv.ParseUint(rawBefore, 10, 64)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "before_id must be a whole number"})
+			return q, false
+		}
+		q.beforeID = uint(v)
+	}
+
+	if rawAfter != "" {
+		v, err := strconv.ParseUint(rawAfter, 10, 64)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "after_seq must be a whole number"})
+			return q, false
+		}
+		q.afterSeq = uint(v)
+		q.gap = true
+	}
+
+	q.limit = defaultPageSize
 	if raw := c.Query("limit"); raw != "" {
 		v, err := strconv.Atoi(raw)
 		if err != nil || v < 1 {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "limit must be a whole number above zero"})
-			return 0, 0, false
+			return q, false
 		}
-		limit = min(v, maxPageSize)
+		q.limit = min(v, maxPageSize)
 	}
-	return beforeID, limit, true
+	return q, true
 }

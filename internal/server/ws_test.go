@@ -209,6 +209,34 @@ func TestWSDeliversNewMessagesToMembersOnly(t *testing.T) {
 	wantNoFrame(t, carolConn)
 }
 
+// Every pushed frame has to carry its seq, and the numbers have to go up by
+// one. This is what a client counts on to notice it missed something: it sees
+// 4 arrive when it was holding 2, and knows to ask for 3.
+//
+// A frame without a seq is worse than useless here — the client would believe
+// it was up to date and never ask for the gap at all.
+func TestWSFramesCarryTheirSeq(t *testing.T) {
+	srv, _, r := newWSTestServer(t)
+	alice, _ := signUp(t, r, "alice")
+
+	room := createRoom(t, r, alice)
+	conn := connect(t, srv, alice)
+	path := fmt.Sprintf("/conversations/%d/messages", room)
+
+	for _, want := range []uint{1, 2, 3} {
+		body := fmt.Sprintf(`{"content":"m%d"}`, want)
+		if rr := do(t, r, "POST", path, body, alice); rr.Code != http.StatusCreated {
+			t.Fatalf("send %d: got %d (body %s)", want, rr.Code, rr.Body)
+		}
+
+		var msg messageDTO
+		decode(t, readFrame(t, conn).Data, &msg)
+		if msg.Seq != want {
+			t.Fatalf("pushed frame %d has seq %d, want %d", want, msg.Seq, want)
+		}
+	}
+}
+
 // The sender sees their own message too. Their other tabs and their phone are
 // showing the same room.
 func TestWSDeliversTheSendersOwnMessage(t *testing.T) {

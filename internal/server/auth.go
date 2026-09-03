@@ -4,6 +4,7 @@ package server
 import (
 	"errors"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
@@ -16,7 +17,31 @@ import (
 
 //this file contains the authentication logic, including token validation and user identification
 
-const tokenTTL = 120 * time.Minute //TODO: should be 15 minutes in production, but longer for dev convenience
+// tokenTTL is how long an access token lives.
+//
+// Fifteen minutes is short on purpose. An access token is never checked against
+// the database, so nothing can take a stolen one out of use except time —
+// logging out ends the session, not the token already in someone's hand. It is
+// also what keeps the cost of `/ws?token=` small, because a token in a URL
+// lands in access logs and proxy logs.
+//
+// Development wants a longer one: nobody wants to log in again every quarter of
+// an hour while writing a handler. So it is read from the environment instead
+// of being a constant with a comment apologising for it. Set
+// ACCESS_TOKEN_TTL=2h in .env, and production keeps the short default by doing
+// nothing at all.
+var tokenTTL = envDuration("ACCESS_TOKEN_TTL", 15*time.Minute)
+
+// envDuration reads a Go duration ("15m", "2h") from the environment. Anything
+// missing, unparseable or zero falls back, so a typo cannot quietly hand out
+// tokens that never expire.
+func envDuration(key string, fallback time.Duration) time.Duration {
+	value, err := time.ParseDuration(os.Getenv(key))
+	if err != nil || value <= 0 {
+		return fallback
+	}
+	return value
+}
 
 // dummyHash is compared against when the username does not exist, so that a
 // bad username costs the same time as a bad password and cannot be

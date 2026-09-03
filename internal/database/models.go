@@ -60,6 +60,12 @@ type Conversation struct {
 	Title       string
 	CreatedByID uint
 
+	// LastSeq is the highest sequence number handed out in this room, and the
+	// allocator for the next one. CreateMessage bumps it and writes the message
+	// in one transaction, so the row lock on this row is what stops two senders
+	// from getting the same number.
+	LastSeq uint
+
 	Members  []ConversationMember
 	Messages []Message
 }
@@ -95,6 +101,14 @@ type Message struct {
 	// any number of NULLs inside a unique index. A plain string would store ""
 	// for every keyless message, and the second one would be rejected.
 	ClientMsgID *string
+
+	// Seq is this message's place in its own room: 1, 2, 3, with no holes. It
+	// is what lets a client that reconnects say "I have 42" and be handed
+	// exactly what came after.
+	//
+	// The global ID cannot do that job. It counts every room at once, so a jump
+	// in it proves nothing about this room.
+	Seq uint
 
 	Content string
 

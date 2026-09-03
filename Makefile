@@ -36,6 +36,23 @@ wsload:
 splitcheck:
 	@go run ./cmd/splitcheck $(ARGS)
 
+# Stage 4: prove that a client which loses its socket does not lose messages.
+#
+# It breaks a socket on purpose while messages keep being sent, reconnects, and
+# repairs the hole with ?after_seq=. The number that matters is MISSING, and it
+# has to be 0.
+#
+#   docker compose up --build -d
+#   make seed ARGS="-n 2"
+#   make gapcheck
+#
+# The harder run: pause, kill Redis during it, and watch live push die while
+# the gap read still brings everything back.
+#
+#   make gapcheck ARGS="-pause 20s"
+gapcheck:
+	@go run ./cmd/gapcheck $(ARGS)
+
 # Migrations. The server applies them itself on startup; these are for looking
 # before you leap, and for stepping back after a mistake.
 migrate-status:
@@ -142,6 +159,6 @@ watch:
 		Write-Output 'Watching...'; \
 	}"
 
-.PHONY: all build run seed wsload splitcheck clean watch docker-run docker-down \
+.PHONY: all build run seed wsload splitcheck gapcheck clean watch docker-run docker-down \
 	test test-v test-one test-race itest cover \
 	migrate-status migrate-up migrate-down migration

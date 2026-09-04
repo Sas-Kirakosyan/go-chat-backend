@@ -132,7 +132,12 @@ itest:
 # command here — and the one most likely to fail to start.
 #
 # It needs cgo and a C compiler. Without gcc on PATH it stops with
-# "-race requires cgo". Install TDM-GCC or MinGW-w64 to get it working.
+# "-race requires cgo". On Windows:
+#
+#   winget install BrechtSanders.WinLibs.POSIX.UCRT
+#
+# winget does not add it to PATH. See the README for the one-line fix, and note
+# that VS Code must be fully restarted, not just given a new terminal tab.
 test-race:
 	@CGO_ENABLED=1 go test -count=1 -race ./...
 

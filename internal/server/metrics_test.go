@@ -86,7 +86,7 @@ func TestAnUnroutedPathDoesNotBecomeALabel(t *testing.T) {
 // A refused request is still a request. A metric that counts only the ones
 // that went well hides the outage.
 func TestRefusedRequestsAreCounted(t *testing.T) {
-	_, r, _ := newTestServerWith(t, rateLimits{authRPS: 1, authBurst: 1})
+	_, r, _ := newTestServerWith(t, frozen(rateLimits{authRPS: 1, authBurst: 1}))
 
 	const creds = `{"username":"alice","password":"wrong-password-here"}`
 	do(t, r, "POST", "/login", creds, "")

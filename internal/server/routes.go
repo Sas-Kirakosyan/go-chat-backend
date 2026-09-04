@@ -37,8 +37,8 @@ func trustedProxies() []string {
 
 func (s *Server) RegisterRoutes() *gin.Engine {
 	limits := s.limits.orDefaults()
-	authLimiter := newRateLimiter(limits.authRPS, limits.authBurst)
-	apiLimiter := newRateLimiter(limits.apiRPS, limits.apiBurst)
+	authLimiter := newRateLimiter(limits.authRPS, limits.authBurst, limits.now)
+	apiLimiter := newRateLimiter(limits.apiRPS, limits.apiBurst, limits.now)
 
 	// This is gin.Default() written out, because both halves of it are
 	// replaced: the logger writes structured lines through slog, and recovery

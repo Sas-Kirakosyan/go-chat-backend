@@ -1253,5 +1253,43 @@ talking, not the code. The rest of the suite needs nothing.
 to start.** It finds two goroutines touching the same memory at the same
 moment, which is the bug this project can have — there are two goroutines per
 socket, and Stage 3 adds more. It needs cgo and a C compiler, and stops with
-`-race requires cgo` when there is no `gcc` on `PATH`. On Windows,
-[TDM-GCC](https://jmeubank.github.io/tdm-gcc/) or MinGW-w64 fixes that.
+`-race requires cgo` when there is no `gcc` on `PATH`.
+
+On Windows, this is the one that works:
+
+```powershell
+winget install BrechtSanders.WinLibs.POSIX.UCRT
+```
+
+winget does **not** put it on `PATH`, so add it by hand and then restart every
+terminal — and VS Code itself, because its terminals inherit the environment
+VS Code started with:
+
+```powershell
+$bin = "$env:LOCALAPPDATA\Microsoft\WinGet\Packages\BrechtSanders.WinLibs.POSIX.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe\mingw64\bin"
+[Environment]::SetEnvironmentVariable("Path", [Environment]::GetEnvironmentVariable("Path","User") + ";$bin", "User")
+```
+
+TDM-GCC also works but is stuck on GCC 10 from 2021. There is no reason to
+prefer it.
+
+### What the race detector found
+
+Nothing, in the concurrency. Every package came back clean, including the hub,
+the per-socket goroutines and the Redis subscriber.
+
+What it did find was **three flaky tests**, which is worth writing down because
+the lesson generalises. The rate-limit tests over real routes spent their
+tokens and expected the next request to be refused. But `-race` makes bcrypt
+take two seconds instead of sixty milliseconds, and a token bucket refills with
+the wall clock — so the bucket quietly refilled mid-test and the request was
+allowed.
+
+Two runs on two machines failed on *different* tests. That is the tell: a test
+whose answer depends on how fast the machine is, is not a test.
+
+The bucket tests always used a fake clock. The fix was to carry that clock
+through `rateLimits` so the middleware tests can freeze time too. Five tests
+now use `frozen(...)`, and one of them was passing for the wrong reason before:
+`TestOperationsRoutesAreNotRateLimited` could have been rescued by a refill,
+hiding a real limiter accidentally wrapped around `/readyz`.

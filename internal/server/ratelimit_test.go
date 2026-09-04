@@ -20,9 +20,26 @@ func (c *fakeClock) advance(d time.Duration) { c.now = c.now.Add(d) }
 
 func newTestLimiter(rate, burst float64) (*rateLimiter, *fakeClock) {
 	clock := &fakeClock{now: time.Now()}
-	l := newRateLimiter(rate, burst)
+	return newRateLimiter(rate, burst, clock.Now), clock
+}
+
+// frozen stops the clock for a test that drives the real routes.
+//
+// The bucket tests below move a fake clock by hand. The middleware tests could
+// not: they build a whole Server, and the limiters inside it ran on the wall
+// clock. So a test that spent its tokens and expected the next request to be
+// refused was really asking "did the next request arrive within a second?".
+//
+// On a fast machine, yes. Under -race a bcrypt login takes two seconds, the
+// bucket refills in the middle of the test, and the request is allowed. The
+// test then fails while the limiter is working perfectly.
+//
+// Frozen time removes the question. No time passes, so no tokens come back,
+// and the test measures the limiter instead of the machine.
+func frozen(l rateLimits) rateLimits {
+	clock := &fakeClock{now: time.Now()}
 	l.now = clock.Now
-	return l, clock
+	return l
 }
 
 func TestBucketAllowsTheBurstThenRefuses(t *testing.T) {
@@ -130,7 +147,7 @@ func TestFullBucketsAreSweptAway(t *testing.T) {
 // Guessing a password is the attack this limit exists for. The route is
 // limited by IP, because the user id is the part being guessed.
 func TestLoginIsRateLimitedByIP(t *testing.T) {
-	_, r, _ := newTestServerWith(t, rateLimits{authRPS: 1, authBurst: 2, apiRPS: 100, apiBurst: 100})
+	_, r, _ := newTestServerWith(t, frozen(rateLimits{authRPS: 1, authBurst: 2, apiRPS: 100, apiBurst: 100}))
 	const creds = `{"username":"alice","password":"wrong-password-here"}`
 
 	for i := 1; i <= 2; i++ {
@@ -158,7 +175,8 @@ func TestLoginIsRateLimitedByIP(t *testing.T) {
 func TestTheAPILimitIsPerUserNotPerIP(t *testing.T) {
 	// A burst of 3: signUp ends with a /auth/profile call, which is behind the
 	// same limiter, so each user arrives here having already spent one token.
-	_, r, _ := newTestServerWith(t, rateLimits{apiRPS: 1, apiBurst: 3})
+	// With the clock frozen that accounting is exact, not approximate.
+	_, r, _ := newTestServerWith(t, frozen(rateLimits{apiRPS: 1, apiBurst: 3}))
 	alice, _ := signUp(t, r, "alice")
 	bob, _ := signUp(t, r, "bob")
 
@@ -180,7 +198,10 @@ func TestTheAPILimitIsPerUserNotPerIP(t *testing.T) {
 // The probes must never be limited. A refused probe looks exactly like a dead
 // node, so the monitoring would take a healthy server out of service.
 func TestOperationsRoutesAreNotRateLimited(t *testing.T) {
-	_, r, _ := newTestServerWith(t, rateLimits{authRPS: 1, authBurst: 1, apiRPS: 1, apiBurst: 1})
+	// Frozen, and that matters here in the other direction: with a live clock a
+	// limiter that WAS wrapped around these routes could be rescued by a refill
+	// between calls, and the test would pass while the bug shipped.
+	_, r, _ := newTestServerWith(t, frozen(rateLimits{authRPS: 1, authBurst: 1, apiRPS: 1, apiBurst: 1}))
 
 	for _, path := range []string{"/livez", "/readyz", "/metrics", "/health"} {
 		for i := 1; i <= 5; i++ {
@@ -195,7 +216,8 @@ func TestOperationsRoutesAreNotRateLimited(t *testing.T) {
 func TestARateLimitedSendStoresNothing(t *testing.T) {
 	// Four tokens, and the setup spends two of them: /auth/profile at the end
 	// of signUp, then the room. That leaves exactly the two sends below.
-	_, r, db := newTestServerWith(t, rateLimits{apiRPS: 1, apiBurst: 4})
+	// "Exactly" only holds with the clock frozen.
+	_, r, db := newTestServerWith(t, frozen(rateLimits{apiRPS: 1, apiBurst: 4}))
 	alice, _ := signUp(t, r, "alice")
 	room := createRoom(t, r, alice)
 

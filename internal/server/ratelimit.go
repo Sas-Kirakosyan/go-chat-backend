@@ -43,6 +43,20 @@ const (
 type rateLimits struct {
 	authRPS, authBurst float64
 	apiRPS, apiBurst   float64
+
+	// now is the clock both limiters run on. Production leaves it nil and gets
+	// time.Now.
+	//
+	// A test that drives real routes sets it, and it has to. A token bucket
+	// refills with the wall clock, so a test that spends its tokens and expects
+	// the next request to be refused is really asking "did the next request
+	// arrive fast enough?" — and the answer changes with the machine. Under
+	// -race a bcrypt login takes two seconds instead of sixty milliseconds, the
+	// bucket quietly refills, and the test fails for a reason that has nothing
+	// to do with the limiter.
+	//
+	// A frozen clock turns that guess back into a fact.
+	now func() time.Time
 }
 
 func (l rateLimits) orDefaults() rateLimits {
@@ -51,6 +65,9 @@ func (l rateLimits) orDefaults() rateLimits {
 	}
 	if l.apiRPS <= 0 || l.apiBurst <= 0 {
 		l.apiRPS, l.apiBurst = defaultAPIRPS, defaultAPIBurst
+	}
+	if l.now == nil {
+		l.now = time.Now
 	}
 	return l
 }
@@ -115,12 +132,16 @@ type rateLimiter struct {
 // sweepEvery is how often idle buckets are cleared out. See sweep.
 const sweepEvery = time.Minute
 
-func newRateLimiter(rate, burst float64) *rateLimiter {
+// newRateLimiter builds a limiter. A nil clock means time.Now.
+func newRateLimiter(rate, burst float64, now func() time.Time) *rateLimiter {
+	if now == nil {
+		now = time.Now
+	}
 	return &rateLimiter{
 		rate:    rate,
 		burst:   burst,
 		buckets: make(map[string]*bucket),
-		now:     time.Now,
+		now:     now,
 	}
 }
 

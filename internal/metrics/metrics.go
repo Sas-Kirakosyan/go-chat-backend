@@ -86,14 +86,40 @@ var (
 		Help:      "Messages written to the database. A repeated client_msg_id stores nothing and is not counted.",
 	})
 
+	// UnreadApplied counts unread-counter rows the consumer really changed.
+	//
+	// It counts ROWS and not messages: one message in a room of fifty moves
+	// forty-nine counters. So this rises much faster than messages_stored_total
+	// on a busy service, and the ratio between them is the average room size,
+	// which is a useful thing to know for free.
+	UnreadApplied = promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: namespace,
+		Name:      "unread_applied_total",
+		Help:      "Unread counter rows changed by the broker consumer.",
+	})
+
+	// UnreadDuplicates counts messages the consumer was handed again and
+	// correctly did nothing with.
+	//
+	// This is the idempotency guard doing its job, and it is the only place
+	// where at-least-once delivery becomes visible. Zero forever is suspicious
+	// rather than perfect: it usually means redelivery has never been tested.
+	// A steady trickle is normal. A spike means something is timing out and
+	// the same work is being handed out twice.
+	UnreadDuplicates = promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: namespace,
+		Name:      "unread_duplicates_total",
+		Help:      "Messages the unread consumer had already applied and skipped. This is at-least-once delivery being caught.",
+	})
+
 	// GapMessages counts messages handed back through ?after_seq=, the gap
 	// read a client uses after reconnecting.
 	//
 	// This is the honest measure of how much live delivery is being missed.
 	// Nothing else shows it: a message that never reaches a socket is still
 	// stored, still answered with 201, and still counted by MessagesStored. A
-	// rising rate here means sockets are dropping, or a node has lost its Redis
-	// subscription while its HTTP metrics stayed perfectly healthy.
+	// rising rate here means sockets are dropping, or a node has lost its
+	// broker subscription while its HTTP metrics stayed perfectly healthy.
 	GapMessages = promauto.NewCounter(prometheus.CounterOpts{
 		Namespace: namespace,
 		Name:      "gap_messages_total",
@@ -187,54 +213,135 @@ func RegisterWebSocket(s WSStats) {
 }
 
 // ClusterStats is what the metrics package needs from the Redis layer.
+//
+// It used to carry the fan-out counters too. Those moved to BrokerStats in
+// Stage 5, along with the fan-out itself; Redis keeps only presence.
 type ClusterStats interface {
-	Published() int
-	Received() int
-	PublishFailed() int
 	PresenceFailed() int
-	Subscribed() bool
 }
 
-// RegisterCluster publishes the cross-node fan-out counters.
-//
-// The pair worth watching is published against received. On a healthy cluster
-// every node receives every message, so summed across N nodes, received should
-// be about N times published. If received stops rising while published keeps
-// going, this node's subscription is dead and its sockets have gone quiet —
-// which is invisible in the HTTP metrics, because sends are still returning
-// 201.
+// RegisterCluster publishes what is left of the Redis counters.
 func RegisterCluster(s ClusterStats) {
+	register(prometheus.NewCounterFunc(prometheus.CounterOpts{
+		Namespace: namespace,
+		Subsystem: "cluster",
+		Name:      "presence_failures_total",
+		Help:      "Presence heartbeats that failed. Enough in a row and this node's users look offline.",
+	}, func() float64 { return float64(s.PresenceFailed()) }))
+}
+
+// OutboxStats is what the metrics package needs from the relay.
+type OutboxStats interface {
+	IsLeader() float64
+	Published() int64
+	Failed() int64
+	Pending() float64
+	LagSeconds() float64
+}
+
+// RegisterOutbox publishes the relay's numbers.
+//
+// # The two that matter
+//
+// lag_seconds is the health of the whole stage in one number. A pending count
+// on its own says nothing — 900 rows could be one busy second — but 900 rows
+// whose oldest has waited four minutes means the relay has stopped, and every
+// message sent in those four minutes is sitting in Postgres. Alert on this
+// one.
+//
+// leader must sum to exactly 1 across the cluster. Zero means nobody is
+// draining and nothing is being delivered anywhere. Two means the advisory
+// lock is broken and two relays are publishing the same rooms out of order.
+// Both are invisible everywhere else: sends still answer 201 either way.
+func RegisterOutbox(s OutboxStats) {
+	register(prometheus.NewGaugeFunc(prometheus.GaugeOpts{
+		Namespace: namespace,
+		Subsystem: "outbox",
+		Name:      "lag_seconds",
+		Help:      "How long the oldest unpublished outbox row has waited. 0 when nothing is waiting.",
+	}, s.LagSeconds))
+
+	register(prometheus.NewGaugeFunc(prometheus.GaugeOpts{
+		Namespace: namespace,
+		Subsystem: "outbox",
+		Name:      "pending",
+		Help:      "Outbox rows not yet published. At rest this is 0.",
+	}, s.Pending))
+
+	register(prometheus.NewGaugeFunc(prometheus.GaugeOpts{
+		Namespace: namespace,
+		Subsystem: "outbox",
+		Name:      "relay_leader",
+		Help:      "1 when this node is the relay. Summed across the cluster this must be exactly 1.",
+	}, s.IsLeader))
+
+	register(prometheus.NewCounterFunc(prometheus.CounterOpts{
+		Namespace: namespace,
+		Subsystem: "outbox",
+		Name:      "published_total",
+		Help:      "Outbox rows this node has drained.",
+	}, func() float64 { return float64(s.Published()) }))
+
+	register(prometheus.NewCounterFunc(prometheus.CounterOpts{
+		Namespace: namespace,
+		Subsystem: "outbox",
+		Name:      "publish_failures_total",
+		Help:      "Failed publish attempts. The rows stay in the table, so delivery is late and not lost.",
+	}, func() float64 { return float64(s.Failed()) }))
+}
+
+// BrokerStats is what the metrics package needs from the NATS layer.
+type BrokerStats interface {
+	Published() int64
+	PublishFailed() int64
+	FanoutReceived() int64
+	UnreadHandled() int64
+	Redelivered() int64
+	DeadLettered() int64
+	Consuming() float64
+}
+
+// RegisterBroker publishes the NATS counters.
+//
+// The pair worth watching is published against fanout_received. Every node
+// receives every message, so summed across N nodes, received should be about N
+// times published. If this node's received stops rising while published keeps
+// going, its subscription is dead and its sockets have gone quiet — which is
+// invisible in the HTTP metrics, because sends are still returning 201.
+//
+// dead_lettered_total should be flat at zero. Any other value is a message
+// that failed five times and now needs a person.
+func RegisterBroker(s BrokerStats) {
 	counter := func(name, help string, read func() float64) {
 		register(prometheus.NewCounterFunc(prometheus.CounterOpts{
 			Namespace: namespace,
-			Subsystem: "cluster",
+			Subsystem: "broker",
 			Name:      name,
 			Help:      help,
 		}, read))
 	}
 
-	counter("fanouts_published_total", "Fan-outs this node published to Redis.",
+	counter("published_total", "Events this node's relay put on the stream.",
 		func() float64 { return float64(s.Published()) })
-	counter("fanouts_received_total", "Fan-outs this node received from Redis, its own included.",
-		func() float64 { return float64(s.Received()) })
-	counter("publish_failures_total", "Fan-outs that could not be published. Each one is a message nobody was pushed.",
+	counter("publish_failures_total", "Publishes the broker refused. The outbox row stays, so the message is late and not lost.",
 		func() float64 { return float64(s.PublishFailed()) })
-	counter("presence_failures_total", "Presence heartbeats that failed. Enough in a row and this node's users look offline.",
-		func() float64 { return float64(s.PresenceFailed()) })
+	counter("fanout_received_total", "Events this node received for its own sockets.",
+		func() float64 { return float64(s.FanoutReceived()) })
+	counter("unread_handled_total", "Events this node acknowledged on the shared unread consumer.",
+		func() float64 { return float64(s.UnreadHandled()) })
+	counter("redelivered_total", "Events that arrived on the shared consumer at least a second time.",
+		func() float64 { return float64(s.Redelivered()) })
+	counter("dead_lettered_total", "Events that failed too many times and went to CHAT_DLQ. Expected value: zero.",
+		func() float64 { return float64(s.DeadLettered()) })
 
 	// The one to alert on. A node at 0 is storing messages and pushing none of
 	// them, and nothing in the HTTP metrics shows it: sends still answer 201.
 	register(prometheus.NewGaugeFunc(prometheus.GaugeOpts{
 		Namespace: namespace,
-		Subsystem: "cluster",
-		Name:      "subscribed",
-		Help:      "1 when this node holds its Redis subscription, 0 when it does not and its sockets are silent.",
-	}, func() float64 {
-		if s.Subscribed() {
-			return 1
-		}
-		return 0
-	}))
+		Subsystem: "broker",
+		Name:      "consuming",
+		Help:      "1 when this node holds its fan-out subscription, 0 when it does not and its sockets are silent.",
+	}, s.Consuming))
 }
 
 // PoolStats is what the metrics package needs from the database layer.

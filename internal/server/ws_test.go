@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -13,6 +14,7 @@ import (
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/gorilla/websocket"
 
+	"go-chat-backend/internal/outbox"
 	"go-chat-backend/internal/ws"
 )
 
@@ -31,14 +33,51 @@ type wsFrame struct {
 }
 
 // newWSTestServer is newTestServer plus a real TCP listener, which a socket
-// needs and httptest.NewRecorder cannot give.
+// needs and httptest.NewRecorder cannot give — and a running relay, which
+// since Stage 5 is what actually puts a message on a socket.
+//
+// The relay matters here. The handler no longer pushes anything: it writes an
+// outbox row and returns. Without a relay these tests would wait for a frame
+// that nobody was ever going to send. Starting one is not a test trick, it is
+// the same wiring server.New uses on a single node — the relay, the local
+// publisher, this node's hub.
+//
+// It also means these tests now cover the whole path: POST, transaction,
+// outbox row, relay, hub, socket. The frame arriving at all proves every step
+// of it.
 func newWSTestServer(t *testing.T) (*httptest.Server, *Server, *gin.Engine) {
 	t.Helper()
-	s, r, _ := newTestServer(t)
+	s, r, db := newTestServer(t)
+
+	startTestRelay(t, s, db)
 
 	srv := httptest.NewServer(r)
 	t.Cleanup(srv.Close)
 	return srv, s, r
+}
+
+// startTestRelay runs the real relay against the fake store until the test
+// ends, exactly as App.startBackground does in single-node mode.
+func startTestRelay(t *testing.T, s *Server, db *fakeDB) {
+	t.Helper()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	relay := outbox.New(db, outbox.NewLocalPublisher(s.deliverMessage, s.applyUnread), quietLogger())
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		relay.Run(ctx)
+	}()
+
+	// Stopped and waited for, not just cancelled. A relay still running into
+	// the next test would write through a hub that test already closed, and
+	// the race detector would report it as a bug in whichever test was
+	// unlucky.
+	t.Cleanup(func() {
+		cancel()
+		<-done
+	})
 }
 
 // dialWS opens a socket. It returns the handshake response too, because a

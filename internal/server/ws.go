@@ -1,12 +1,17 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
+	"log/slog"
 	"net/http"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
+
+	"go-chat-backend/internal/event"
+	"go-chat-backend/internal/metrics"
 )
 
 // allowedWSOrigin is the browser page that may open a socket. It is the same
@@ -128,42 +133,54 @@ func wsAccessToken(c *gin.Context) (string, bool) {
 	return "", false
 }
 
-// broadcastMessage pushes a stored message to every member of its room,
-// wherever in the cluster they are connected.
+// deliverMessage pushes one message to the sockets this node holds.
 //
-// It is best effort, on purpose. The message is already committed to Postgres
-// and the sender already has its 201; a delivery that fails here is a missed
-// live push, not a lost message, and the client can still read it from
-// history. Stage 4 is where that gap gets closed properly.
-func (s *Server) broadcastMessage(c *gin.Context, conversationID uint, msg messageDTO) {
-	memberIDs, err := s.db.ListConversationMemberIDs(c.Request.Context(), conversationID)
-	if err != nil {
-		logFrom(c).Error("ws could not list room members",
-			"conversation_id", conversationID, "err", err)
-		return
-	}
-
+// It is the last step of the delivery path and the only place that turns an
+// event into WebSocket bytes. Whatever brought the event here — the broker on
+// a clustered node, or the relay's local publisher on a single one — ends up
+// calling this.
+//
+// It is a method with no *gin.Context, and that is the Stage 5 change in one
+// line. Delivery used to happen inside the request that caused it; now the
+// request is long finished and this runs on a background goroutine.
+//
+// It stays best effort. A frame that does not reach a socket is a missed live
+// push, not a lost message: the message is committed, and a client that
+// notices a hole in its seq numbers asks for it with ?after_seq=. Retrying at
+// this level would push at sockets that are already gone.
+func (s *Server) deliverMessage(ev event.MessageCreated, userIDs []uint) {
 	// Marshalled once and shared by every receiver: fifty members in a room
 	// cost one encode, not fifty.
-	payload, err := json.Marshal(wsEnvelope{Type: wsMessageEvent, Data: msg})
+	payload, err := json.Marshal(wsEnvelope{Type: wsMessageEvent, Data: eventToMessageDTO(ev)})
 	if err != nil {
-		logFrom(c).Error("ws could not encode message", "message_id", msg.ID, "err", err)
+		slog.Error("ws could not encode message", "message_id", ev.MessageID, "err", err)
 		return
 	}
+	s.hub.Broadcast(userIDs, payload)
+}
 
-	// Single node: straight to the local hub, as in Stage 2.
-	if s.cluster == nil {
-		s.hub.Broadcast(memberIDs, payload)
-		return
+// applyUnread is the durable work the broker consumer does for one message.
+//
+// It lives here, and not in the broker package, because it is a database
+// write and the broker knows nothing about the database. The broker decides
+// when it runs and what happens if it fails; this decides what it does.
+//
+// An error returned here means "hand this message out again", so it must only
+// ever describe a problem that could go away — a database that is restarting.
+// The statement behind it is idempotent, so a message counted twice moves the
+// number once.
+func (s *Server) applyUnread(ctx context.Context, ev event.MessageCreated) error {
+	changed, err := s.db.ApplyUnread(ctx, ev.MessageID, ev.ConversationID, ev.SenderID, ev.Seq)
+	if err != nil {
+		return err
 	}
-
-	// Cluster: publish and stop. This node does NOT also deliver locally — it
-	// will receive its own message back through the subscription, like every
-	// other node. One path in means a member on this node cannot get the
-	// message twice, and it means the delivery code is exercised on every
-	// message rather than only on the ones that cross a node boundary.
-	if err := s.cluster.Publish(c.Request.Context(), memberIDs, payload); err != nil {
-		logFrom(c).Error("cluster could not publish message",
-			"message_id", msg.ID, "conversation_id", conversationID, "err", err)
+	if changed == 0 {
+		// Nothing moved, which means the inbox row was already there and this
+		// message has been counted before. That is a redelivery doing no harm,
+		// which is exactly what it is supposed to do.
+		metrics.UnreadDuplicates.Inc()
+		return nil
 	}
+	metrics.UnreadApplied.Add(float64(changed))
+	return nil
 }

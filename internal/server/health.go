@@ -42,13 +42,18 @@ func (s *Server) livezHandler(c *gin.Context) {
 //  2. The database is unreachable. Nearly every route needs it, so answering
 //     them here would only produce 500s.
 //
-// Redis is deliberately NOT checked, even though Stage 3 made live delivery
-// depend on it. Redis is shared by every node, so a Redis outage would fail
-// this probe on all of them at once, the load balancer would take the whole
-// service out, and users would lose login, history and sending — none of which
-// need Redis. A shared dependency in a readiness probe turns one broken thing
-// into a total outage. Live delivery degrades instead, and /health below says
-// so.
+// Redis and NATS are deliberately NOT checked, even though live delivery
+// depends on NATS. Both are shared by every node, so an outage of either would
+// fail this probe on all of them at once, the load balancer would take the
+// whole service out, and users would lose login, history and sending — none of
+// which need either one. A shared dependency in a readiness probe turns one
+// broken thing into a total outage.
+//
+// The outbox is what makes that safe to say now rather than merely bearable. A
+// send with NATS down still commits, and the row waits in Postgres until the
+// broker returns. So this node really is ready: it can accept everything, and
+// only the delivery of it is late. Delivery degrades, /health below says so,
+// and outbox_lag_seconds on /metrics says by how much.
 func (s *Server) readyzHandler(c *gin.Context) {
 	if s.draining.Load() {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"status": "shutting down"})
@@ -70,11 +75,16 @@ func (s *Server) readyzHandler(c *gin.Context) {
 func (s *Server) healthHandler(c *gin.Context) {
 	stats := s.db.Health()
 
-	// Redis appears here and nowhere else. This is the page a person opens when
-	// "my friend on the other node sees nothing", and redis:"down" answers that
-	// question in one line. It does not change the status code: the node is
-	// serving fine, it just cannot reach the other nodes.
+	// Redis and NATS appear here and nowhere else. This is the page a person
+	// opens when "my friend on the other node sees nothing", and one of these
+	// two lines usually answers it. Neither changes the status code: the node
+	// is serving fine, it just cannot reach the other nodes.
+	//
+	// nats:"down" is the one to read first now. Redis being down costs
+	// presence; NATS being down costs live delivery, and the messages are
+	// piling up in the outbox until it returns.
 	stats["redis"] = s.redisStatus(c)
+	stats["nats"] = s.natsStatus(c)
 
 	if stats["status"] != "up" {
 		c.JSON(http.StatusServiceUnavailable, stats)
@@ -85,9 +95,19 @@ func (s *Server) healthHandler(c *gin.Context) {
 
 func (s *Server) redisStatus(c *gin.Context) string {
 	if s.cluster == nil {
-		return "not configured (single node)"
+		return "not configured (no presence)"
 	}
 	if err := s.cluster.Ping(c.Request.Context()); err != nil {
+		return "down: " + err.Error()
+	}
+	return "up"
+}
+
+func (s *Server) natsStatus(c *gin.Context) string {
+	if s.broker == nil {
+		return "not configured (single node, delivering locally)"
+	}
+	if err := s.broker.Ping(c.Request.Context()); err != nil {
 		return "down: " + err.Error()
 	}
 	return "up"

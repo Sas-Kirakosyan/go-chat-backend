@@ -24,10 +24,13 @@
 //
 //	make gapcheck ARGS="-pause 20s"
 //
-// then `docker compose kill redis` during the pause. Live push dies completely
+// then `docker compose kill nats` during the pause. Live push dies completely
 // — nothing is delivered to any socket — and the gap read still has to bring
 // back every message. That is the difference between "delivery works" and
 // "delivery is guaranteed".
+//
+// It was `kill redis` until Stage 5 moved the fan-out to NATS. Killing Redis
+// now costs presence and nothing else, so this run would quietly prove nothing.
 package main
 
 import (
@@ -74,7 +77,7 @@ func main() {
 
 	flag.DurationVar(&cfg.wait, "wait", 3*time.Second, "how long to wait for a live frame")
 	flag.DurationVar(&cfg.pause, "pause", 0,
-		"hold before the gap phase — long enough to `docker compose kill redis`")
+		"hold before the gap phase — long enough to `docker compose kill nats`")
 	flag.Parse()
 
 	if err := run(cfg); err != nil {
@@ -144,7 +147,7 @@ func run(cfg config) error {
 	fmt.Printf("   seq %v, B saw %d live\n\n", sent, len(seen))
 
 	if cfg.pause > 0 {
-		fmt.Printf("   pausing %s — now is the time to `docker compose kill redis`\n\n", cfg.pause)
+		fmt.Printf("   pausing %s — now is the time to `docker compose kill nats`\n\n", cfg.pause)
 		time.Sleep(cfg.pause)
 	}
 

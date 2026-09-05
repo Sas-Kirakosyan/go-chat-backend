@@ -112,7 +112,12 @@ type Service interface {
 	// in this room, nothing is written and no number is used up: the first
 	// message comes back with created set to false. It returns
 	// ErrConversationNotFound if the room is gone.
-	CreateMessage(ctx context.Context, conversationID, senderID uint, content string, clientMsgID *string) (msg *Message, created bool, err error)
+	//
+	// The same transaction writes the outbox row that tells the rest of the
+	// system about the message, so a message can never exist without an
+	// instruction to deliver it. senderName is passed in because the caller is
+	// the sender and their token already carries the name.
+	CreateMessage(ctx context.Context, conversationID, senderID uint, senderName, content string, clientMsgID *string) (msg *Message, created bool, err error)
 
 	// ListMessages returns up to limit messages from a room, newest first,
 	// with the sender loaded. A beforeID above zero returns only messages
@@ -125,6 +130,64 @@ type Service interface {
 	// opposite of ListMessages: missed messages are applied in the order they
 	// were sent.
 	ListMessagesAfterSeq(ctx context.Context, conversationID, afterSeq uint, limit int) ([]Message, error)
+
+	// ---- The outbox. Everything here is used by the relay, not by a handler.
+
+	// TryOutboxLock asks to be the one node that runs the relay. It returns
+	// nil, nil when another node already holds it, which is the normal answer
+	// and not an error. The lock lives on its own connection and dies with it,
+	// so a crashed leader is replaced without any cleanup step.
+	TryOutboxLock(ctx context.Context) (*OutboxLock, error)
+
+	// FetchOutbox returns the oldest unpublished rows in id order, at most
+	// limit of them. The order is what keeps messages inside one room in the
+	// order they were written.
+	FetchOutbox(ctx context.Context, limit int) ([]Outbox, error)
+
+	// MarkOutboxPublished stamps rows as done. It runs after the publish, so a
+	// crash in between sends the message twice rather than never.
+	MarkOutboxPublished(ctx context.Context, ids []uint64) error
+
+	// MarkOutboxFailed records a failed publish attempt on one row and leaves
+	// it unpublished, so it is tried again. The stored reason is for a human
+	// reading a stuck queue.
+	MarkOutboxFailed(ctx context.Context, id uint64, reason string) error
+
+	// DeleteOutboxPublishedBefore removes rows published before t and returns
+	// how many. Published rows are kept for a short while so that a stuck or
+	// strange delivery can still be looked at.
+	DeleteOutboxPublishedBefore(ctx context.Context, t time.Time) (int64, error)
+
+	// OutboxStats reports how many rows are waiting and when the oldest of
+	// them was written. oldest is the zero time when nothing waits. The age of
+	// the oldest row is the number that says whether the relay is alive.
+	OutboxStats(ctx context.Context) (pending int64, oldest time.Time, err error)
+
+	// ---- Unread counters. Written by the broker consumer, read by handlers.
+
+	// ApplyUnread adds one to the unread count of every member of a room
+	// except the sender, and does nothing if this message was already counted.
+	// It returns how many rows really changed, so a redelivery can be told
+	// apart from real work.
+	//
+	// The guard is a row in consumed_messages written in the same transaction,
+	// which is what makes it safe under a consumer shared by several nodes
+	// that finish messages out of order.
+	ApplyUnread(ctx context.Context, messageID, conversationID, senderID, seq uint) (int64, error)
+
+	// DeleteConsumedBefore removes inbox rows older than t. They only have to
+	// outlive the broker's own retention, because that is the longest a
+	// message can still be redelivered.
+	DeleteConsumedBefore(ctx context.Context, t time.Time) (int64, error)
+
+	// UnreadForUser returns the unread count per room for one user. Rooms with
+	// nothing unread are missing from the map, so a missing key means zero.
+	UnreadForUser(ctx context.Context, userID uint) (map[uint]int64, error)
+
+	// MarkConversationRead sets one user's unread count in one room to zero.
+	// It does not move the consumer's bookmark, so a message that arrives at
+	// the same moment is still counted from now on.
+	MarkConversationRead(ctx context.Context, conversationID, userID uint) error
 
 	// Close terminates the database connection.
 	// It returns an error if the connection cannot be closed.

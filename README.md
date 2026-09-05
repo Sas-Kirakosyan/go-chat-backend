@@ -12,18 +12,23 @@ Authentication with refresh-token sessions, the conversation REST API, the
 WebSocket delivery layer, and the observability and safety work around them are
 implemented and tested.
 
-Delivery now runs across **two nodes behind nginx**, joined by Redis Pub/Sub,
-with presence in Redis and a per-node view on `/metrics`. Stopping Redis costs
-the live push and nothing else — see [Two nodes](#two-nodes).
+Delivery runs across **two nodes behind nginx**, with presence in Redis and a
+per-node view on `/metrics` — see [Two nodes](#two-nodes).
 
-Every message now carries a **per-room sequence number**, so a client that
-loses its socket can see exactly what it missed and ask for it. Delivery is
+Every message carries a **per-room sequence number**, so a client that loses
+its socket can see exactly what it missed and ask for it. Delivery is
 at-least-once: a message may arrive twice, never zero times — see
 [Delivery guarantees](#delivery-guarantees).
 
-Still missing: the handler writes to Postgres and then publishes to Redis. If
-it dies between the two, the message exists and nobody is told until someone
-asks for a gap. That dual write is the next stage.
+The send path now does **one write**. The message row and an outbox row commit
+together, and a relay publishes them to **NATS JetStream** afterwards. Kill the
+broker and sends still answer 201; the messages queue in Postgres and go out
+when it comes back. A consumer on the same stream keeps unread counters, with
+retries and a dead-letter queue — see [The outbox and the broker](#the-outbox-and-the-broker).
+
+Still missing: the relay polls, so live delivery costs up to 100ms more than it
+did. Postgres `LISTEN/NOTIFY` would remove that, and there is no second service
+yet — everything still runs in one binary. That split is the next stage.
 
 ## Endpoints
 
@@ -40,10 +45,11 @@ asks for a gap. That dual write is the next stage.
 | `POST` | `/auth/logout`                | cookie | End the session                             |
 | `GET`  | `/auth/profile`               | bearer | The current user                            |
 | `POST` | `/conversations`              | bearer | Create a room                               |
-| `GET`  | `/conversations`              | bearer | Rooms I am a member of                      |
+| `GET`  | `/conversations`              | bearer | Rooms I am a member of, each with its `unread_count` |
 | `POST` | `/conversations/:id/members`  | bearer | Add someone to a room                       |
 | `POST` | `/conversations/:id/messages` | bearer | Send a message                              |
 | `GET`  | `/conversations/:id/messages` | bearer | History newest first, or the gap after `?after_seq=` |
+| `POST` | `/conversations/:id/read`     | bearer | Set my unread count for this room to zero   |
 | `GET`  | `/conversations/:id/presence` | bearer | Who in the room is online, cluster-wide     |
 
 Tokens are HS256, valid for 15 minutes by default, and sent as
@@ -446,6 +452,27 @@ another service.
 | `chat_rate_limited_total{scope}` | counter | requests refused with 429 |
 | `chat_panics_recovered_total` | counter | should be flat at zero |
 | `chat_db_pool_*` | gauges + counters | the pool that Stage 1 found was the real bottleneck |
+| `chat_gap_messages_total`, `chat_gap_size` | counter + histogram | how much live delivery is being missed, and by whom |
+| `chat_outbox_lag_seconds` | gauge | **how far behind delivery is.** The one to alert on |
+| `chat_outbox_pending` | gauge | outbox rows not yet published. 0 at rest |
+| `chat_outbox_relay_leader` | gauge | 1 on the node draining the outbox. Must sum to exactly 1 |
+| `chat_outbox_published_total`, `chat_outbox_publish_failures_total` | counters | what the relay got out, and what it could not |
+| `chat_broker_consuming` | gauge | 1 while this node holds its fan-out subscription |
+| `chat_broker_published_total`, `chat_broker_fanout_received_total` | counters | published once, received by every node |
+| `chat_broker_redelivered_total` | counter | at-least-once delivery, visible |
+| `chat_broker_dead_lettered_total` | counter | should be flat at zero |
+| `chat_unread_applied_total`, `chat_unread_duplicates_total` | counters | consumer work done, and redeliveries correctly ignored |
+
+Two of those deserve an alert, and neither has an HTTP symptom — a broken
+cluster still answers `201` to every send:
+
+- `chat_outbox_lag_seconds` above a few seconds means messages are written and
+  not being delivered. A pending count alone says nothing: 900 rows could be
+  one busy second, while 900 rows whose oldest has waited four minutes means
+  the relay has stopped.
+- `sum(chat_outbox_relay_leader)` other than 1. Zero means nobody is draining.
+  Two means the advisory lock is broken and one room's messages are going out
+  in the wrong order.
 
 The Go runtime and process collectors come free with the default registry.
 `go_goroutines` is the one to watch here: this service runs **two goroutines
@@ -661,35 +688,43 @@ lands, so the same command fails differently on every run. Once, both sockets
 landed on one node and the message went to the other, and **nobody** received
 it. A bug that changes shape each time is the one that survives a whole sprint.
 
-### Redis Pub/Sub, and one delivery path
+### One delivery path
 
-The fix is in [`internal/cluster`](internal/cluster). The write path publishes
-to one Redis channel; every node subscribes and fans out to its own local
-sockets only. The hub does not change at all — Redis plugs in beside it, which
-is what the Stage 1 note in [`internal/ws`](internal/ws) was written for.
+The fix was Redis Pub/Sub: the write path published to one channel, every node
+subscribed, and each fanned out to its own local sockets. The hub did not
+change at all — the transport plugs in beside it, which is what the Stage 1
+note in [`internal/ws`](internal/ws) was written for.
+
+That transport is now NATS, for reasons that are the whole of
+[the next section](#the-outbox-and-the-broker), and the plug-in point held: the
+hub still did not change, and neither did the decision below.
 
 The decision worth defending: **a node does not deliver its own message
-locally.** It publishes, and then receives it back through the subscription
-like every other node. One path in, so a member on the sending node cannot get
-the message twice, and the cross-node path is exercised by every single message
-rather than only by the ones that happen to cross a boundary.
+locally.** The relay publishes, and every node — the sending one included —
+receives it back through its subscription. One path in, so a member on the
+sending node cannot get the message twice, and the cross-node path is exercised
+by every single message rather than only by the ones that happen to cross a
+boundary.
 
-The counters say it worked. After two messages, one sent on each node:
+The counters say it works. After two messages, one sent on each node:
 
 | Metric | api1 | api2 |
 | ------ | ---- | ---- |
-| `chat_cluster_fanouts_published_total` | 1 | 1 |
-| `chat_cluster_fanouts_received_total` | 2 | 2 |
+| `chat_broker_published_total` | 2 | 0 |
+| `chat_broker_fanout_received_total` | 2 | 2 |
 | `chat_ws_frames_sent_total` | 2 | 2 |
 
-Two published, four received (both nodes hear both), and two frames per node —
-one per message, per socket. No duplicates.
+Publishing is no longer split between the nodes, because only the relay
+publishes and only one node is the relay — see
+[One relay, chosen by a lock](#one-relay-chosen-by-a-lock). Both nodes still
+receive both messages, and each sends one frame per message per socket. No
+duplicates.
 
-One channel for the whole system, not one per room. A channel per room would
-mean subscribing and unsubscribing as people come and go, and a node holding
-sockets in 5000 rooms would carry 5000 subscriptions. Every node reading
-everything is more traffic and far less bookkeeping, and the filter is cheap: a
-node drops any fan-out whose users it does not hold.
+One subject tree for the whole system, not a subscription per room. A consumer
+per room would mean creating and deleting consumers as people come and go, and
+a node holding sockets in 5000 rooms would carry 5000 of them. Every node
+reading everything is more traffic and far less bookkeeping, and the filter is
+cheap: a node drops any fan-out whose users it does not hold.
 
 ### Presence, and why it is a timer
 
@@ -741,16 +776,18 @@ redis`, then measure every path.
 
 | Path | Redis up | Redis down |
 | ---- | -------- | ---------- |
-| `POST /conversations/:id/messages` | 201 in **8 ms** | 201 in **510 ms** |
-| `GET /conversations/:id/messages` | 200 in **5 ms** | 200 in **5 ms** |
+| `POST /conversations/:id/messages` | 201 in **12 ms** | 201 in **10 ms** |
+| `GET /conversations/:id/messages` | 200 in **9 ms** | 200 in **8 ms** |
+| `GET /conversations` | 200 in **8 ms** | 200 in **11 ms** |
 | `GET /conversations/:id/presence` | 200 in **6 ms** | **503** in 1.0 s |
 | `GET /readyz` | 200 | **200** |
-| Live delivery | both nodes | **none** |
+| Live delivery | both nodes | **both nodes** |
 
-Sends still succeed, history is untouched, the nodes stay in the load balancer,
-and only the live push stops. That is the shape a degraded chat should have.
+Only presence breaks now. Since Stage 5 moved the fan-out to NATS, Redis holds
+nothing that delivery needs, and the blast radius of losing it shrank to one
+endpoint.
 
-Three things had to be fixed to get there, and all three were found by running
+Three things had to be fixed to get here, and all three were found by running
 this, not by thinking about it.
 
 **Presence hung for over 15 seconds.** With Redis stopped, the handler waited
@@ -760,37 +797,39 @@ longer exists is slow by itself, so the waits stack. Any handler that touches a
 shared service needs its own deadline. One second, and presence now fails fast
 with a 503.
 
-**Every send took 2.009 seconds.** That was the publish timeout, and the
-timeout was not protecting the write path — it *was* the write path's problem.
-It is 500 ms now: far above a healthy publish, and survivable during an outage.
-Publishing in a goroutine would make the POST instant and is the wrong answer,
-because two messages sent in order could reach Redis out of order. A chat that
-reorders lines is broken in a way a slow one is not.
+**Every send took 2.009 seconds.** Back when Redis carried the fan-out, the
+handler published inside the request, and the publish timeout was not
+protecting the write path — it *was* the write path's problem. Dropping it to
+500 ms made an outage survivable rather than painless, and publishing in a
+goroutine was rejected because two messages sent in order could then reach
+Redis out of order.
+
+That whole trade-off is gone. The handler does not publish at all any more; it
+commits an outbox row and returns, and a relay publishes afterwards. The number
+in the table above is the proof: a send during a **broker** outage is 10 ms,
+the same as a healthy one. The answer to "how slow is a send when the messaging
+system is down" turned out to be "it does not touch it".
 
 **The nodes crash-looped.** The first version pinged Redis at startup and
 called `os.Exit` if it failed. With Redis down, restarting the nodes put them
 in a restart loop: exit 1, restart, fail, exit 1. A Redis outage had become a
 total outage — no login, no history, no sending — for a service that is
 supposed to lose only its live push. Now it logs one line and starts anyway.
+`broker.FromEnv` follows the same rule for NATS.
 
-That last one is the same rule as `/readyz`, which deliberately does **not**
-check Redis. Redis is shared by every node, so a Redis outage would fail the
-probe on all of them at once and the load balancer would take the whole service
-out. A shared dependency in a readiness probe turns one broken thing into an
-outage. `/health` reports `redis: down` for the human, and the status code
-stays 200.
+That last one is the same rule as `/readyz`, which deliberately checks
+**neither** Redis nor NATS. Both are shared by every node, so an outage of
+either would fail the probe on all of them at once and the load balancer would
+take the whole service out. A shared dependency in a readiness probe turns one
+broken thing into an outage. `/health` reports `redis: down` and `nats: down`
+for the human, and the status code stays 200.
 
-Recovery needs no restart. `docker compose start redis`, and within a few
-seconds both nodes report `chat_cluster_subscribed 1` and `make splitcheck`
-passes again. That works because the subscriber retries in a loop:
-`go-redis` reconnects a subscription it already had, but it can do nothing
-about a subscribe that never succeeded — which is exactly a node that started
-during the outage. Without the retry loop such a node would run forever, taking
-messages and never pushing one.
+Recovery needs no restart in either case. `docker compose start redis`, and
+presence answers again within a couple of seconds.
 
-`chat_cluster_subscribed` is the metric to alert on. A node stuck at 0 is
-storing messages and pushing none of them, and nothing in the HTTP metrics
-shows it: every send still answers 201.
+`chat_broker_consuming` is the metric to alert on. A node stuck at 0 is storing
+messages and pushing none of them, and nothing in the HTTP metrics shows it:
+every send still answers 201.
 
 ## Delivery guarantees
 
@@ -886,10 +925,10 @@ counts. B is disconnected for the middle five:
   MISSING         0
 ```
 
-The run worth doing twice is the one with Redis killed in the middle:
+The run worth doing twice is the one with the broker killed in the middle:
 
 ```
-make gapcheck ARGS="-pause 30s"      # then: docker compose kill redis
+make gapcheck ARGS="-pause 30s"      # then: docker compose kill nats
 ```
 
 Live push stops completely — not for one socket, for every socket on every
@@ -938,12 +977,216 @@ sharded. That trade is worth making only with a real room that needs it.
 
 ### What this does not fix
 
-- Redis Pub/Sub is still fire and forget. This stage lets a client *notice and
+- The live push is still best effort. This stage lets a client *notice and
   repair* a miss; it does not stop the miss.
-- The handler still writes Postgres and then publishes. That dual write is the
-  next stage's outbox.
 - The client has to actually ask. A client that never reconnects never learns
   anything, and a client that ignores `seq` is exactly as broken as before.
+
+## The outbox and the broker
+
+Up to here the send path did **two** writes:
+
+```
+commit the message to Postgres   →   publish to Redis
+```
+
+Two systems, one after the other, with nothing holding them together. If the
+process died in between, the message existed and **nobody was ever told**. The
+sender already had its `201`. That is the **dual-write problem**, and no amount
+of retrying inside the handler fixes it, because the process that would do the
+retry is the one that died.
+
+Redis Pub/Sub had a second problem with the same root: it stores nothing. A
+node that was restarting when a message was published never learned about it,
+and there was nobody left to ask. Fine while the only consumer was a socket and
+history was the real record. Not fine the moment something else has to react to
+a message.
+
+### One write
+
+`CreateMessage` now writes the message row **and** an outbox row in the same
+transaction:
+
+```go
+tx.Create(msg)                                  // the message
+tx.Create(&Outbox{Topic: ..., Payload: ...})    // the instruction to deliver it
+```
+
+Both land or neither does. The instruction to publish lives in the same
+database as the thing it describes, so it survives everything the message
+survives, and a relay can crash at any point and start again from the same row.
+
+The handler no longer knows that sockets exist.
+
+One thing falls out for free and is worth naming: a repeated `client_msg_id`
+fails the unique index, the transaction rolls back, and the outbox row goes
+with it. A client retrying a send five times produces one message, one
+delivery, and no burned sequence numbers. The Stage 4 dedupe key now protects
+the broker too.
+
+### One relay, chosen by a lock
+
+Every node starts a relay; they fight over a Postgres advisory lock, and the
+winner drains. `pg_try_advisory_lock` on a dedicated connection, which is the
+same trick goose already uses so two nodes can migrate at once.
+
+The lock dies with its connection. So a node that is killed with `-9` frees it
+without a lease to expire or a stale row to clean up, and another node takes
+over within five seconds.
+
+**One** relay, not many, because order is worth more than throughput here. Two
+relays working the same table with `SELECT ... FOR UPDATE SKIP LOCKED` would
+publish seq 5 before seq 4 and throw away what Stage 4 built.
+
+`chat_outbox_relay_leader` must sum to exactly 1 across the cluster. Zero means
+nothing is being delivered anywhere; two means the lock is broken.
+
+Measured: `docker compose kill api2` while it held the lock, and api1 reported
+itself leader **4 seconds** later. `make outboxcheck` straight afterwards
+delivered 8 of 8 with nothing missing. No lease to expire, no repair step.
+
+### The price: latency
+
+The relay polls, so a message waits up to `OUTBOX_POLL_INTERVAL` — 100 ms by
+default — before it goes out. Measured end to end, POST to frame on the wire,
+the slowest of three was **306 ms** against **8 ms** in Stage 3.
+
+That is the honest cost of never losing one, and it is a cost worth naming out
+loud rather than burying. Postgres `LISTEN/NOTIFY` would cut it to nearly
+nothing and is deliberately not in this stage — the trade is documented, and it
+can be paid down later without changing the design.
+
+### Two consumers, two opposite shapes
+
+The same stream feeds two things that want opposite delivery rules, and the
+contrast is the most useful thing in the stage.
+
+| | `fanout` | `unread` |
+| --- | --- | --- |
+| Who needs it | **every** node | exactly **one** node |
+| Consumer | one per node, ephemeral | one durable, shared by name |
+| Starts at | new messages only | the beginning |
+| Acks | none | explicit, `AckWait` 30 s |
+| On failure | nothing | redeliver, then dead-letter |
+
+Fan-out is per node because each node owns different sockets; a shared consumer
+would hand each message to one node and every member connected elsewhere would
+see nothing. It does not replay after a restart, and that is correct rather
+than lazy: the sockets that would have received those messages are closed, and
+their clients repair themselves with `?after_seq=`. Replaying would push at
+sockets that no longer exist and deliver twice to the ones that do.
+
+Unread is shared because the work is a **write**, and it must happen once for
+the cluster and not once per node. That is where acks, redelivery and the
+dead-letter queue live.
+
+### Idempotency, and the bug that proved it was needed
+
+Delivery is at-least-once, so the unread consumer **will** be handed the same
+message twice — a consumer that did its work and died before its ack sees it
+again on restart.
+
+The first version guarded that with a high water mark on the counter row: only
+apply a `seq` higher than the last one applied. It passed every test written
+for it, because every test applied messages in order.
+
+Then `make outboxcheck` ran against two nodes:
+
+```
+C unread       12   (want 14: C never connected, so this is the consumer's work)
+FAIL  C's unread count is 12, want 14
+```
+
+Two messages of fourteen, silently uncounted. Both nodes share one consumer, so
+they work on different messages at the same time and commit in whatever order
+they finish. Node A commits seq 9, node B then commits seq 8 — and seq 8 was
+not a duplicate, it was **late**. A high water mark cannot tell those apart.
+
+The fix is an **inbox**: one row per message in `consumed_messages`, written in
+the same transaction as the counters.
+
+```sql
+INSERT INTO consumed_messages (consumer, message_id)
+VALUES ('unread', $1)
+ON CONFLICT DO NOTHING;          -- zero rows means: already done, stop here
+```
+
+"Have I seen this message" gives the same answer no matter when it is asked.
+Order stops mattering. It is the mirror of the outbox — the outbox stops a
+message being published zero times, the inbox stops it being applied twice —
+and both halves are needed because delivery is at-least-once at both ends.
+
+There are two more layers behind it. JetStream drops a repeat of a message id
+inside a five-minute window, which covers a relay that published and died
+before it could mark the row done. And the inbox covers everything after that
+window closes.
+
+### Poison messages
+
+A message that fails five times is not going to work on the sixth. It is
+copied to a second stream, `CHAT_DLQ`, and then `Term`'d so JetStream never
+hands it out again. The copy happens **first**: `Term` is final, so
+terminating before the evidence is safe would throw it away.
+
+Without that step one bad message is retried forever and the whole queue waits
+behind it.
+
+`chat_broker_dead_lettered_total` should be flat at zero. Any other value is a
+message that needs a person. Read them with `nats stream view CHAT_DLQ`, or the
+monitoring page on <http://localhost:8222/jsz?streams=1>.
+
+### Measured: what happens when NATS stops
+
+`docker compose stop nats`, then measure every path:
+
+| Path | NATS up | NATS down |
+| ---- | ------- | --------- |
+| `POST /conversations/:id/messages` | 201 in **12 ms** | 201 in **10 ms** |
+| `GET /conversations/:id/messages` | 200 in **9 ms** | 200 in **8 ms** |
+| `GET /conversations` | 200 in **8 ms** | 200 in **9 ms** |
+| `GET /conversations/:id/presence` | 200 in **6 ms** | 200 in **7 ms** |
+| `GET /readyz` | 200 | **200** |
+| Live delivery | both nodes | **none** |
+
+Not one path is slower. Sends are entirely unaffected by the messaging system
+being gone, which is the whole point of the stage: the messages queue in
+Postgres and `chat_outbox_pending` climbs while `chat_outbox_lag_seconds` says
+how far behind delivery has fallen. `docker compose start nats` and the relay
+drains it with no restart and no repair step.
+
+`make outboxcheck` is the proof, with NATS killed before the run:
+
+```
+phase 1  4 messages with the broker up
+         0 of 4 arrived live
+         outbox: 4 pending, oldest 9.6s old
+phase 2  8 messages, broker expected down
+         8 accepted, 0 refused
+phase 3  12 recovered after the broker returned
+
+result
+  sent           15
+  refused        0
+  delivered      15   live 0, recovered 12, live again 3
+  missing        0    []
+  in history     15 of 15
+  C unread       15   (want 15)
+```
+
+Twelve messages sent with the broker completely gone, every one accepted, every
+one delivered afterwards, and each counted exactly once.
+
+### A second bug the same run found
+
+With NATS stopped, the relay retried the first row **545 times in one second**.
+Every attempt was a failed publish, a log line, and an `UPDATE` to record the
+failure — so a broker outage made the *database* busier, which is the opposite
+of what a queue is for.
+
+The loop could not tell "nothing was waiting" from "everything was waiting and
+none of it moved". `Drain` now reports both numbers, and the second case backs
+off for five seconds instead of 100 ms. The same outage now produces **8
+attempts in 97 seconds**.
 
 ## Shutdown
 
@@ -1036,13 +1279,20 @@ Everything else is optional and has a working default:
 | `RATE_LIMIT_AUTH_BURST` | `20` | how many may arrive at once |
 | `RATE_LIMIT_API_RPS` | `20` | authenticated requests per second, per user |
 | `RATE_LIMIT_API_BURST` | `40` | how many may arrive at once |
-| `REDIS_ADDR` | unset | `host:port` of Redis. Unset means single-node: messages still reach this node's own sockets, and no others |
+| `REDIS_ADDR` | unset | `host:port` of Redis. Unset means presence is not tracked. Delivery does not use it |
 | `REDIS_PASSWORD` | unset | only if your Redis needs one |
-| `NODE_ID` | hostname | the name this node uses in its logs and in presence |
+| `NATS_URL` | unset | `nats://host:port`. Unset means single-node: messages still reach this node's own sockets, and no others |
+| `OUTBOX_POLL_INTERVAL` | `100ms` | how long the relay waits when the queue is empty. This is the delivery latency the outbox costs |
+| `OUTBOX_RETENTION` | `1h` | how long a published outbox row is kept before it is deleted |
+| `INBOX_RETENTION` | `48h` | how long `consumed_messages` remembers a handled message. Must stay above the stream's own 24h retention, or a redelivery could be counted twice |
+| `NODE_ID` | hostname | the name this node uses in its logs, in presence, and in its fan-out consumer |
 | `TRUSTED_PROXIES` | unset | addresses or CIDRs whose `X-Forwarded-For` is believed. Unset means trust nobody |
 
-`REDIS_ADDR` is the switch between one node and many. Compose sets it; `make
-run` does not, so local development needs no Redis at all.
+`NATS_URL` is the switch between one node and many. Compose sets it; `make run`
+does not, so local development needs no broker at all — the relay still runs
+and still drains, straight into this node's hub. That is deliberate: the
+single-node path and the clustered path are the same program with a different
+last step, so the one that gets tested most is the one that runs in production.
 
 The limits are configurable because a limit that fits real users does not fit a
 load test — see [Rate limits](#rate-limits).
@@ -1132,7 +1382,7 @@ migrates the database its old way.
 
 ### The cluster
 
-`docker compose up` starts Postgres, Redis, two API nodes and nginx:
+`docker compose up` starts Postgres, Redis, NATS, two API nodes and nginx:
 
 | Address | What |
 | ------- | ---- |
@@ -1141,21 +1391,33 @@ migrates the database its old way.
 | `localhost:8082` | `api2` directly |
 | `localhost:5434` | Postgres |
 | `localhost:6380` | Redis |
+| `localhost:4222` | NATS |
+| `localhost:8222` | the NATS monitoring page — try `/jsz?streams=1` |
 
 The two node ports are not how a client is meant to connect. They exist so a
-test can say "put this socket on that node", which is what `make splitcheck`
-and `make gapcheck` do. The database and Redis are published on unusual ports on purpose: a
-natively installed Postgres or Redis takes the normal one, and the failure that
-causes is nasty — on this machine, Docker held `5433` on IPv6 while a native
-Postgres held it on IPv4, so a host tool reached one or the other depending on
-which address family it picked, and reported a wrong password.
+test can say "put this socket on that node", which is what `make splitcheck`,
+`make gapcheck` and `make outboxcheck` do. The database and Redis are published
+on unusual ports on purpose: a natively installed Postgres or Redis takes the
+normal one, and the failure that causes is nasty — on this machine, Docker held
+`5433` on IPv6 while a native Postgres held it on IPv4, so a host tool reached
+one or the other depending on which address family it picked, and reported a
+wrong password.
+
+Redis has no volume and NATS has one, and the difference is the point. Redis
+holds claims about right now that are stale within 30 seconds. NATS holds
+messages somebody still has to act on, and a restart that lost them would lose
+exactly the unread counts this stage was built to keep.
 
 The container database is its own database. To seed it, point the tool at the
 published port:
 
 ```bash
-BLUEPRINT_DB_HOST=127.0.0.1 BLUEPRINT_DB_PORT=5434 make seed ARGS="-n 2"
+BLUEPRINT_DB_HOST=127.0.0.1 BLUEPRINT_DB_PORT=5434 make seed ARGS="-n 3"
 ```
+
+Forgetting that is an easy hour to lose: plain `make seed` reads `.env`, writes
+to the database on `localhost:5432`, and reports success — into a database the
+cluster is not using. The logins then fail with `401` and nothing explains why.
 
 ## MakeFile
 
@@ -1203,7 +1465,16 @@ make splitcheck ARGS="-hold 60s"    # then kill a node and watch presence
 Check that a client which loses its socket loses no messages:
 ```bash
 make gapcheck
-make gapcheck ARGS="-pause 30s"     # then `docker compose kill redis`
+make gapcheck ARGS="-pause 30s"     # then `docker compose kill nats`
+```
+
+Check that killing the broker delays messages and loses none (seed three users
+first — the third never connects, so their unread count is the consumer's work
+and nothing else):
+```bash
+make seed ARGS="-n 3"
+make outboxcheck
+make outboxcheck ARGS="-pause 25s"  # then kill and restart nats during the pause
 ```
 
 Live reload the application:
@@ -1252,7 +1523,8 @@ talking, not the code. The rest of the suite needs nothing.
 **`make test-race` is the valuable one here, and the one most likely to refuse
 to start.** It finds two goroutines touching the same memory at the same
 moment, which is the bug this project can have — there are two goroutines per
-socket, and Stage 3 adds more. It needs cgo and a C compiler, and stops with
+socket, and every stage since has added more: the presence heartbeat, the
+relay, and two broker consumers. It needs cgo and a C compiler, and stops with
 `-race requires cgo` when there is no `gcc` on `PATH`.
 
 On Windows, this is the one that works:
@@ -1276,7 +1548,15 @@ prefer it.
 ### What the race detector found
 
 Nothing, in the concurrency. Every package came back clean, including the hub,
-the per-socket goroutines and the Redis subscriber.
+the per-socket goroutines, the relay and the broker consumers.
+
+The bugs this stage had were not races, and neither of them could have been
+found by a unit test — both needed two real nodes and a broker that was really
+gone. They are written up in
+[The outbox and the broker](#the-outbox-and-the-broker): a counter that dropped
+messages arriving out of order, and a relay that retried a stuck queue 545
+times a second. Tests were added for both **after** the run found them, which
+is the honest order and worth admitting.
 
 What it did find was **three flaky tests**, which is worth writing down because
 the lesson generalises. The rate-limit tests over real routes spent their

@@ -1,13 +1,14 @@
-# Stage 3 turns this file into a small cluster: one database, two API nodes,
-# and nginx in front of them.
+# Stage 3 turned this file into a small cluster: one database, two API nodes,
+# and nginx in front of them. Stage 5 added the broker they now talk through.
 #
-#   docker compose up --build            database + api1 + api2 + nginx
+#   docker compose up --build            database + redis + nats + api1 + api2 + nginx
 #   docker compose --profile observability up -d   ... and Prometheus
 #
 # Ports:
 #   8080  nginx, the address a client should use
 #   8081  api1 directly
 #   8082  api2 directly
+#   8222  the NATS monitoring page
 #
 # The two node ports are not how a client is meant to connect. They exist so a
 # test can say "put this socket on that node" and prove what each node does or
@@ -22,6 +23,8 @@ x-api: &api
     psql_bp:
       condition: service_healthy
     redis:
+      condition: service_healthy
+    nats:
       condition: service_healthy
   environment: &api-env
     PORT: 8080
@@ -41,10 +44,17 @@ x-api: &api
     # it, any client could claim another IP and walk around the per-IP rate
     # limit by sending one header.
     TRUSTED_PROXIES: ${TRUSTED_PROXIES:-172.16.0.0/12}
-    # The one setting that turns single-node mode into cluster mode. Unset it
-    # and a node still runs, still stores messages, and still pushes to its own
-    # sockets — it simply stops hearing about anyone else's.
+    # Presence. Unset it and a node still runs, still stores messages and
+    # still delivers them; it simply stops tracking who is online.
     REDIS_ADDR: redis:6379
+    # The one setting that turns single-node mode into cluster mode. Unset it
+    # and a node still accepts everything and still pushes to its own sockets —
+    # it simply stops hearing about anyone else's.
+    #
+    # Note what it does NOT control: whether a send works. The message and the
+    # instruction to deliver it are one transaction in Postgres, so a node with
+    # no broker at all still takes writes and hands them over when it returns.
+    NATS_URL: nats://nats:4222
 
 services:
   psql_bp:
@@ -96,6 +106,33 @@ services:
       - "6380:6379"
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+      start_period: 2s
+
+  nats:
+    image: nats:2.12-alpine
+    restart: unless-stopped
+    # -js turns JetStream on, which is the whole reason NATS is here rather
+    # than plain Pub/Sub: JetStream keeps the message until a consumer says the
+    # work is done. -sd is where it keeps it.
+    command: ["-js", "-sd", "/data", "-m", "8222"]
+    volumes:
+      # Redis has no volume and this does, and the difference is the point.
+      # Redis holds claims about right now that are stale in 30 seconds; this
+      # holds messages that somebody still has to act on. A restart that lost
+      # them would lose exactly the unread counts the stage was built to keep.
+      - nats_volume:/data
+    ports:
+      # 4222 is the client port. 8222 is the monitoring page — open
+      # http://localhost:8222/jsz?streams=1 to see the streams and the
+      # consumers without installing the nats CLI.
+      - "4222:4222"
+      - "8222:8222"
+    healthcheck:
+      # /healthz on the monitoring port. wget is what the alpine image has.
+      test: ["CMD-SHELL", "wget -q -O- http://localhost:8222/healthz || exit 1"]
       interval: 3s
       timeout: 3s
       retries: 10
@@ -154,3 +191,4 @@ services:
 
 volumes:
   psql_volume_bp:
+  nats_volume:

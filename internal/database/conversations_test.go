@@ -127,7 +127,7 @@ func TestMessageStore(t *testing.T) {
 	// Five messages, ids going up.
 	ids := make([]uint, 0, 5)
 	for _, text := range []string{"m1", "m2", "m3", "m4", "m5"} {
-		msg, created, err := srv.CreateMessage(ctx, conv.ID, sender.ID, text, nil)
+		msg, created, err := srv.CreateMessage(ctx, conv.ID, sender.ID, sender.Username, text, nil)
 		if err != nil || !created {
 			t.Fatalf("CreateMessage(%s) = created %v, err %v", text, created, err)
 		}
@@ -157,11 +157,11 @@ func TestMessageStore(t *testing.T) {
 
 	// The same client_msg_id twice is a retry, not a second message.
 	key := "client-key-1"
-	first, created, err := srv.CreateMessage(ctx, conv.ID, sender.ID, "once", &key)
+	first, created, err := srv.CreateMessage(ctx, conv.ID, sender.ID, sender.Username, "once", &key)
 	if err != nil || !created {
 		t.Fatalf("CreateMessage(with key) = created %v, err %v", created, err)
 	}
-	again, created, err := srv.CreateMessage(ctx, conv.ID, sender.ID, "once again", &key)
+	again, created, err := srv.CreateMessage(ctx, conv.ID, sender.ID, sender.Username, "once again", &key)
 	if err != nil {
 		t.Fatalf("CreateMessage(same key) returned %v", err)
 	}
@@ -170,12 +170,12 @@ func TestMessageStore(t *testing.T) {
 	}
 
 	// The key only has to be unique per sender, so another user may reuse it.
-	if _, created, err := srv.CreateMessage(ctx, conv.ID, other.ID, "mine", &key); err != nil || !created {
+	if _, created, err := srv.CreateMessage(ctx, conv.ID, other.ID, other.Username, "mine", &key); err != nil || !created {
 		t.Fatalf("CreateMessage(same key, other sender) = created %v, err %v; want a new message", created, err)
 	}
 
 	// Two nil keys must both be stored: NULL is not a duplicate.
-	if _, created, err := srv.CreateMessage(ctx, conv.ID, sender.ID, "no key", nil); err != nil || !created {
+	if _, created, err := srv.CreateMessage(ctx, conv.ID, sender.ID, sender.Username, "no key", nil); err != nil || !created {
 		t.Fatalf("CreateMessage(nil key) = created %v, err %v", created, err)
 	}
 }
@@ -205,7 +205,7 @@ func TestMigrateIsVersionedAndRepeatable(t *testing.T) {
 	}
 	// Bump this when a migration is added. It is a deliberate speed bump: a
 	// new .sql file should be a conscious act, not something that slips in.
-	if want := int64(4); version != want {
+	if want := int64(5); version != want {
 		t.Fatalf("database is at version %d, want %d", version, want)
 	}
 
@@ -228,8 +228,17 @@ func TestMigrateIsVersionedAndRepeatable(t *testing.T) {
 			t.Errorf("column %s present = %v, want %v", c.name, got, c.want)
 		}
 	}
-	if !m.HasTable(&ConversationMember{}) {
-		t.Error("conversation_members table is missing")
+	for _, model := range []any{&ConversationMember{}, &Outbox{}, &UnreadCounter{}} {
+		if !m.HasTable(model) {
+			t.Errorf("table for %T is missing", model)
+		}
+	}
+
+	// The outbox table is "outbox", not "outboxes". HasTable above goes
+	// through TableName, so it would pass either way; this is the check that
+	// the name in the migration and the name GORM uses are the same string.
+	if !m.HasTable("outbox") {
+		t.Error(`the outbox table is not called "outbox"`)
 	}
 }
 
@@ -256,7 +265,7 @@ func TestMigrateDownAndUpMovesOwnerToMember(t *testing.T) {
 	// cannot name the sender of an old row, so clear the two tables first.
 	// Users are left alone.
 	if err := s.db.WithContext(ctx).Exec(
-		`TRUNCATE messages, conversation_members, conversations RESTART IDENTITY`).Error; err != nil {
+		`TRUNCATE unread_counters, messages, conversation_members, conversations RESTART IDENTITY`).Error; err != nil {
 		t.Fatalf("truncate: %v", err)
 	}
 
@@ -296,7 +305,7 @@ func TestMigrateDownAndUpMovesOwnerToMember(t *testing.T) {
 
 	// Leave a clean table for whatever runs next.
 	if err := s.db.WithContext(ctx).Exec(
-		`TRUNCATE messages, conversation_members, conversations RESTART IDENTITY`).Error; err != nil {
+		`TRUNCATE unread_counters, messages, conversation_members, conversations RESTART IDENTITY`).Error; err != nil {
 		t.Fatalf("cleanup truncate: %v", err)
 	}
 }

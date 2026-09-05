@@ -9,6 +9,7 @@ import (
 	"github.com/gin-gonic/gin"
 
 	"go-chat-backend/internal/database"
+	"go-chat-backend/internal/event"
 	"go-chat-backend/internal/metrics"
 )
 
@@ -40,6 +41,14 @@ type conversationDTO struct {
 	CreatedByID uint      `json:"created_by_id"`
 	CreatedAt   time.Time `json:"created_at"`
 	Members     []userDTO `json:"members"`
+
+	// UnreadCount is how many messages the caller has not read in this room.
+	//
+	// It is the first field in this API that no handler computes. A consumer
+	// on the broker maintains it in the background, so it can be a moment
+	// behind the truth, and that is the trade the whole stage is about: the
+	// sender's request does not wait for everyone else's badge to be updated.
+	UnreadCount int64 `json:"unread_count"`
 }
 
 type messageDTO struct {
@@ -117,6 +126,26 @@ func toMessageDTO(m database.Message) messageDTO {
 	}
 }
 
+// eventToMessageDTO builds the same wire shape from an outbox event.
+//
+// There are two ways into messageDTO now, because there are two sources: a row
+// read from Postgres for history, and an event that came through the broker
+// for a live push. They must produce the same JSON — a client cannot be asked
+// to parse a message differently depending on how it arrived — so both live
+// here, next to each other, where a change to one is hard to make without
+// seeing the other.
+func eventToMessageDTO(ev event.MessageCreated) messageDTO {
+	return messageDTO{
+		ID:             ev.MessageID,
+		ConversationID: ev.ConversationID,
+		Sender:         userDTO{ID: ev.SenderID, Username: ev.SenderName},
+		Content:        ev.Content,
+		ClientMsgID:    ev.ClientMsgID,
+		Seq:            ev.Seq,
+		CreatedAt:      ev.CreatedAt,
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Handlers
 // ---------------------------------------------------------------------------
@@ -153,11 +182,51 @@ func (s *Server) ListConversationsHandler(c *gin.Context) {
 		return
 	}
 
+	// One query for every badge on the screen, not one per room. A room the
+	// user has read has no row, so a missing key means zero.
+	//
+	// A failure here is not a failure of the page. The rooms are the answer;
+	// the badges are decoration, and a list that loads with no badges is far
+	// better than a 500. This is the first place in the service where a
+	// dependency is allowed to degrade the response instead of ending it, and
+	// it is allowed because nothing here is a fact the user relies on.
+	unread, err := s.db.UnreadForUser(c.Request.Context(), userID)
+	if err != nil {
+		logFrom(c).Warn("could not read unread counters, sending the list without them", "err", err)
+		unread = nil
+	}
+
 	out := make([]conversationDTO, 0, len(convs))
 	for _, conv := range convs {
-		out = append(out, toConversationDTO(conv))
+		dto := toConversationDTO(conv)
+		dto.UnreadCount = unread[conv.ID]
+		out = append(out, dto)
 	}
 	c.JSON(http.StatusOK, gin.H{"conversations": out})
+}
+
+// MarkReadHandler handles POST /conversations/:id/read. It sets the caller's
+// unread count for the room back to zero.
+//
+// It takes no body. "I have read this room" is the only thing a client can say
+// here, and a seq in the body would only invite a client to send a number it
+// never actually reached.
+//
+// The consumer's own bookmark is not moved, so a message that arrives during
+// this request is still counted from now on. See MarkConversationRead for the
+// small race that leaves, and why it is accepted.
+func (s *Server) MarkReadHandler(c *gin.Context) {
+	conversationID, ok := s.memberOnly(c)
+	if !ok {
+		return
+	}
+	userID, _ := currentUser(c)
+
+	if err := s.db.MarkConversationRead(c.Request.Context(), conversationID, userID); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Could not mark the conversation read"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"conversation_id": conversationID, "unread_count": 0})
 }
 
 // AddMemberHandler handles POST /conversations/:id/members. Any member may add
@@ -199,8 +268,15 @@ func (s *Server) AddMemberHandler(c *gin.Context) {
 
 // SendMessageHandler handles POST /conversations/:id/messages.
 //
-// This is the only path that ever writes a message. The WebSocket, when it
-// arrives, will only deliver what this handler stored.
+// This is the only path that ever writes a message. The WebSocket only
+// delivers what this handler stored.
+//
+// It does exactly one write, and that is the Stage 5 change. It used to commit
+// the message and then publish it, and a process that died between those two
+// steps left a message that existed and that nobody was ever told about. Now
+// the message row and the instruction to deliver it commit together, and a
+// relay picks the instruction up afterwards. This handler no longer knows that
+// sockets exist.
 func (s *Server) SendMessageHandler(c *gin.Context) {
 	conversationID, ok := s.memberOnly(c)
 	if !ok {
@@ -219,7 +295,7 @@ func (s *Server) SendMessageHandler(c *gin.Context) {
 		clientMsgID = &req.ClientMsgID
 	}
 
-	msg, created, err := s.db.CreateMessage(c.Request.Context(), conversationID, userID, req.Content, clientMsgID)
+	msg, created, err := s.db.CreateMessage(c.Request.Context(), conversationID, userID, username, req.Content, clientMsgID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Could not send message"})
 		return
@@ -238,15 +314,16 @@ func (s *Server) SendMessageHandler(c *gin.Context) {
 	}
 	c.JSON(status, out)
 
-	// Only a real new row is pushed. A retry stored nothing, so pushing again
-	// would show the same line twice on every screen in the room — the exact
-	// double-post that client_msg_id exists to prevent.
-	//
-	// The counter follows the same rule, so rate() over it is the real write
+	// Only a real new row is counted, so rate() over this is the real write
 	// rate rather than the request rate.
+	//
+	// There is nothing to push here any more. A retry of a client_msg_id we
+	// already hold wrote no message row, and so wrote no outbox row either —
+	// the rollback took both — which means the double-post that client_msg_id
+	// exists to prevent is now prevented one layer deeper, in the transaction
+	// itself, instead of by this if.
 	if created {
 		metrics.MessagesStored.Inc()
-		s.broadcastMessage(c, conversationID, out)
 	}
 }
 

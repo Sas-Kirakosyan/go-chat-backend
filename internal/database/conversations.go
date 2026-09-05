@@ -6,6 +6,8 @@ import (
 	"fmt"
 
 	"gorm.io/gorm"
+
+	"go-chat-backend/internal/event"
 )
 
 //this file content (database) talk to Postgres
@@ -161,7 +163,17 @@ func (s *service) ListConversationMemberIDs(ctx context.Context, conversationID 
 //
 // The cost is real and worth knowing: writes into ONE room are now serialised
 // on one row. Different rooms never touch the same row and are unaffected.
-func (s *service) CreateMessage(ctx context.Context, conversationID, senderID uint, content string, clientMsgID *string) (*Message, bool, error) {
+//
+// The same transaction also writes the outbox row that tells the rest of the
+// system this message exists. That is the Stage 5 change, and it is the whole
+// point: the handler used to commit the message and THEN publish, and a crash
+// between those two steps left a message nobody was ever told about. Now there
+// is one write. Either both rows are there or neither is.
+//
+// senderName is passed in rather than read from the users table, because the
+// caller is the sender and their token already carries the name. One less
+// query on the busiest path in the service.
+func (s *service) CreateMessage(ctx context.Context, conversationID, senderID uint, senderName, content string, clientMsgID *string) (*Message, bool, error) {
 	msg := &Message{
 		ConversationID: conversationID,
 		SenderID:       senderID,
@@ -187,8 +199,41 @@ func (s *service) CreateMessage(ctx context.Context, conversationID, senderID ui
 		}
 		msg.Seq = seq
 
-		// Returned unwrapped, so the errors.Is below can still see it.
-		return tx.Create(msg).Error
+		// Returned unwrapped, so the errors.Is below can still see it. The
+		// unique index on client_msg_id fires here, and nothing after this
+		// line runs when it does.
+		if err := tx.Create(msg).Error; err != nil {
+			return err
+		}
+
+		// The outbox row, in the same transaction as the message.
+		//
+		// Note where it sits: after the insert, because it needs the id and
+		// the seq the insert just produced. And note what a duplicate
+		// client_msg_id does — it fails the line above, the whole transaction
+		// rolls back, and this row is never written. So a client that retries
+		// a send five times still produces exactly one outbox row and exactly
+		// one delivery. The dedupe key from Stage 4 protects the broker too,
+		// for free.
+		payload, err := event.MessageCreated{
+			MessageID:      msg.ID,
+			ConversationID: conversationID,
+			SenderID:       senderID,
+			SenderName:     senderName,
+			Seq:            seq,
+			Content:        content,
+			ClientMsgID:    clientMsgID,
+			CreatedAt:      msg.CreatedAt,
+		}.Encode()
+		if err != nil {
+			return err
+		}
+
+		row := &Outbox{Topic: event.TopicMessageCreated, Payload: payload}
+		if err := tx.Create(row).Error; err != nil {
+			return fmt.Errorf("insert outbox row: %w", err)
+		}
+		return nil
 	})
 
 	if errors.Is(err, gorm.ErrDuplicatedKey) && clientMsgID != nil {

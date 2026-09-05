@@ -53,6 +53,28 @@ splitcheck:
 gapcheck:
 	@go run ./cmd/gapcheck $(ARGS)
 
+# Stage 5: prove that killing the broker delays messages and does not lose them.
+#
+# It sends while NATS is down. Every send must still answer 201, because the
+# message and the instruction to deliver it are one transaction in Postgres.
+# When NATS comes back the relay drains the backlog and everything arrives.
+#
+# Three numbers have to be right: MISSING 0, REFUSED 0, and the unread count of
+# the user who never connected, which must equal the number of messages sent —
+# not one more, which is what proves the consumer is idempotent.
+#
+#   docker compose up --build -d
+#   make seed ARGS="-n 3"
+#   make outboxcheck
+#
+# The real run: pause, and kill and restart NATS during it.
+#
+#   make outboxcheck ARGS="-pause 25s"
+#   docker compose kill nats     # during the pause
+#   docker compose start nats    # a few seconds later
+outboxcheck:
+	@go run ./cmd/outboxcheck $(ARGS)
+
 # Migrations. The server applies them itself on startup; these are for looking
 # before you leap, and for stepping back after a mistake.
 migrate-status:
@@ -164,6 +186,6 @@ watch:
 		Write-Output 'Watching...'; \
 	}"
 
-.PHONY: all build run seed wsload splitcheck gapcheck clean watch docker-run docker-down \
+.PHONY: all build run seed wsload splitcheck gapcheck outboxcheck clean watch docker-run docker-down \
 	test test-v test-one test-race itest cover \
 	migrate-status migrate-up migrate-down migration

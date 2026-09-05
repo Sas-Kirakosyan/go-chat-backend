@@ -40,6 +40,20 @@ type fakeDB struct {
 	// cannot be a map key. The methods live in refresh_test.go.
 	sessions      map[string]*database.RefreshToken
 	nextSessionID uint
+
+	// The outbox and the unread counters, written by CreateMessage and drained
+	// by the relay. The methods live in outbox_test.go.
+	//
+	// unread is keyed by room and then by user, which is the same shape as the
+	// real table's primary key.
+	outbox       []database.Outbox
+	nextOutboxID uint64
+	unread       map[uint]map[uint]*database.UnreadCounter
+	lockHeld     bool
+
+	// consumed is the inbox: the message ids the unread consumer has already
+	// handled. It is what makes applying the same message twice a no-op.
+	consumed map[uint]bool
 }
 
 func newFakeDB() *fakeDB {
@@ -49,6 +63,8 @@ func newFakeDB() *fakeDB {
 		conversations: map[uint]*database.Conversation{},
 		memberIDs:     map[uint][]uint{},
 		sessions:      map[string]*database.RefreshToken{},
+		unread:        map[uint]map[uint]*database.UnreadCounter{},
+		consumed:      map[uint]bool{},
 		healthy:       true,
 	}
 }

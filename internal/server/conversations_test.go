@@ -12,6 +12,7 @@ import (
 	"gorm.io/gorm"
 
 	"go-chat-backend/internal/database"
+	"go-chat-backend/internal/event"
 )
 
 // ---------------------------------------------------------------------------
@@ -109,7 +110,7 @@ func (f *fakeDB) ListConversationMemberIDs(_ context.Context, conversationID uin
 	return append([]uint(nil), f.memberIDs[conversationID]...), nil
 }
 
-func (f *fakeDB) CreateMessage(_ context.Context, conversationID, senderID uint, content string, clientMsgID *string) (*database.Message, bool, error) {
+func (f *fakeDB) CreateMessage(_ context.Context, conversationID, senderID uint, senderName, content string, clientMsgID *string) (*database.Message, bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
@@ -118,6 +119,9 @@ func (f *fakeDB) CreateMessage(_ context.Context, conversationID, senderID uint,
 			if m.ConversationID == conversationID && m.SenderID == senderID &&
 				m.ClientMsgID != nil && *m.ClientMsgID == *clientMsgID {
 				dup := m
+				// No outbox row, and that is the behaviour under test: the real
+				// store rolls the whole transaction back on a duplicate key, so
+				// a retry produces no second instruction to deliver.
 				return &dup, false, nil
 			}
 		}
@@ -143,6 +147,32 @@ func (f *fakeDB) CreateMessage(_ context.Context, conversationID, senderID uint,
 		Seq:            conv.LastSeq,
 	}
 	f.messages = append(f.messages, msg)
+
+	// The outbox row, written here because the real store writes it in the
+	// same transaction as the message. Nothing in the handler tests drains it;
+	// what they check is that it exists, and exactly once. The relay tests in
+	// outbox_test.go are the ones that take it out again.
+	payload, err := event.MessageCreated{
+		MessageID:      msg.ID,
+		ConversationID: conversationID,
+		SenderID:       senderID,
+		SenderName:     senderName,
+		Seq:            msg.Seq,
+		Content:        content,
+		ClientMsgID:    clientMsgID,
+		CreatedAt:      msg.CreatedAt,
+	}.Encode()
+	if err != nil {
+		return nil, false, err
+	}
+	f.nextOutboxID++
+	f.outbox = append(f.outbox, database.Outbox{
+		ID:        f.nextOutboxID,
+		Topic:     event.TopicMessageCreated,
+		Payload:   payload,
+		CreatedAt: msg.CreatedAt,
+	})
+
 	return &msg, true, nil
 }
 

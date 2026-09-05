@@ -115,3 +115,81 @@ type Message struct {
 	// Sender is a belongs-to association, populated with .Preload("Sender").
 	Sender User `gorm:"foreignKey:SenderID"`
 }
+
+// Outbox is one event waiting to reach the broker.
+//
+// The row is written in the same transaction as the message it describes, so
+// the two commit together. Before this table the handler wrote the message and
+// then published, and a crash between the two lost the publish for good.
+//
+// It does not embed gorm.Model: a soft-deleted outbox row is a contradiction.
+// The relay stamps PublishedAt, and old rows are deleted for real.
+type Outbox struct {
+	ID uint64 `gorm:"primarykey"`
+
+	// Topic is the kind of event. Today always OutboxTopicMessageCreated.
+	Topic string
+
+	// Payload is the event as JSON text. The column is jsonb, so Postgres
+	// checks that it really is JSON and you can query inside it while
+	// debugging.
+	Payload string
+
+	CreatedAt time.Time
+
+	// PublishedAt is nil while the row is still waiting. The relay asks for
+	// exactly these rows, which is why the index on them is partial.
+	PublishedAt *time.Time
+
+	// Attempts and LastError are for a human reading the table, not for the
+	// code. They say how hard the relay has tried and what went wrong last.
+	Attempts  int
+	LastError *string
+}
+
+// TableName pins the table to "outbox".
+//
+// GORM names tables by pluralising the struct, which turns Outbox into
+// "outboxes" — a word that is technically correct and that nobody would ever
+// type at a psql prompt. The migration creates "outbox", so this is what makes
+// the two agree.
+//
+// It is the one place a struct in this file overrides the schema, and it is
+// only a name. The columns still come from the SQL.
+func (Outbox) TableName() string { return "outbox" }
+
+// ConsumedMessage says that one consumer has already handled one message.
+//
+// It is the inbox, and it is the mirror of Outbox above: the outbox stops a
+// message being published zero times, and this stops it being applied twice.
+// Delivery is at-least-once, so both halves are needed.
+//
+// The row is written in the same transaction as the work it guards, so a
+// consumer that crashes half way leaves neither behind and gets the message
+// again.
+type ConsumedMessage struct {
+	Consumer   string `gorm:"primarykey"`
+	MessageID  uint   `gorm:"primarykey"`
+	ConsumedAt time.Time
+}
+
+// UnreadCounter is how many messages one user has not read in one room.
+//
+// It is maintained by the broker consumer, not by the send handler, so the
+// sender's request does not pay for it.
+//
+// It does not embed gorm.Model: the primary key is (ConversationID, UserID),
+// and a soft-deleted counter would still be counted by the unique key.
+type UnreadCounter struct {
+	ConversationID uint `gorm:"primarykey"`
+	UserID         uint `gorm:"primarykey"`
+
+	UnreadCount int64
+
+	// LastSeq is the highest message seq counted into this row. Nothing
+	// depends on it — ConsumedMessage is the guard — and it is kept because it
+	// is the first thing a person wants when a badge looks wrong.
+	LastSeq uint
+
+	UpdatedAt time.Time
+}

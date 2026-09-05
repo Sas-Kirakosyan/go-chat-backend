@@ -232,6 +232,19 @@ is told. That is the **dual-write problem**.
   notifications.
 - Add retries, a dead-letter queue, and an idempotent consumer.
 
+What the build taught that the plan did not say: **an idempotent consumer needs
+a per-message guard, not a high water mark.** Two nodes sharing one consumer
+finish messages in whatever order they finish, so a message that commits after
+a higher one is not a duplicate — it is late, and a "only apply a newer seq"
+guard drops it silently. The fix is an inbox table, one row per message, which
+is the mirror of the outbox. A two-node run found it in a minute; no unit test
+would have, because unit tests apply messages in order.
+
+Second thing: **a queue that cannot drain must back off.** With the broker
+stopped, the relay retried the first row 545 times a second, each attempt
+writing a failure to the database. An outage of the messaging system was making
+the database busier.
+
 **Learn:** dual writes, consumer groups, redelivery, poison messages. This is
 what most job ads mean by "distributed systems".
 
@@ -312,7 +325,7 @@ worked on one.
 - [x] Stage 2 — Observability and safety
 - [x] Stage 3 — Two nodes, Redis Pub/Sub, presence
 - [x] Stage 4 — Delivery guarantees
-- [ ] Stage 5 — Outbox and a broker
+- [x] Stage 5 — Outbox and a broker
 - [ ] Stage 6 — A second service over gRPC
 - [ ] Stage 7 — Tracing
 - [ ] Stage 8 — Data scale, load and chaos tests

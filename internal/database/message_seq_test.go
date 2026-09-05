@@ -34,7 +34,7 @@ func TestMessageSeqStartsAtOneAndIsPerRoom(t *testing.T) {
 	}
 
 	for i, want := range []uint{1, 2, 3} {
-		msg, created, err := srv.CreateMessage(ctx, roomA.ID, sender.ID, "hello", nil)
+		msg, created, err := srv.CreateMessage(ctx, roomA.ID, sender.ID, sender.Username, "hello", nil)
 		if err != nil || !created {
 			t.Fatalf("CreateMessage(#%d) = created %v, err %v", i, created, err)
 		}
@@ -46,7 +46,7 @@ func TestMessageSeqStartsAtOneAndIsPerRoom(t *testing.T) {
 	// The counter belongs to the room, not to the database. A busy room next
 	// door must not push room B's first message to seq 4 — that is exactly the
 	// hole a client would try to fill and never could.
-	msg, created, err := srv.CreateMessage(ctx, roomB.ID, sender.ID, "hello", nil)
+	msg, created, err := srv.CreateMessage(ctx, roomB.ID, sender.ID, sender.Username, "hello", nil)
 	if err != nil || !created {
 		t.Fatalf("CreateMessage(room B) = created %v, err %v", created, err)
 	}
@@ -85,7 +85,7 @@ func TestMessageSeqUnderConcurrentSenders(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			msg, created, err := srv.CreateMessage(ctx, conv.ID, sender.ID, "at once", nil)
+			msg, created, err := srv.CreateMessage(ctx, conv.ID, sender.ID, sender.Username, "at once", nil)
 
 			mu.Lock()
 			defer mu.Unlock()
@@ -138,7 +138,7 @@ func TestMessageSeqNotBurnedByRetry(t *testing.T) {
 	}
 
 	key := "retry-key"
-	first, created, err := srv.CreateMessage(ctx, conv.ID, sender.ID, "once", &key)
+	first, created, err := srv.CreateMessage(ctx, conv.ID, sender.ID, sender.Username, "once", &key)
 	if err != nil || !created {
 		t.Fatalf("CreateMessage(first) = created %v, err %v", created, err)
 	}
@@ -149,7 +149,7 @@ func TestMessageSeqNotBurnedByRetry(t *testing.T) {
 	// Three retries of the same key. Each one rolls its transaction back, so
 	// each one gives its number back too.
 	for i := range 3 {
-		again, created, err := srv.CreateMessage(ctx, conv.ID, sender.ID, "once", &key)
+		again, created, err := srv.CreateMessage(ctx, conv.ID, sender.ID, sender.Username, "once", &key)
 		if err != nil {
 			t.Fatalf("CreateMessage(retry %d) returned %v", i, err)
 		}
@@ -162,7 +162,7 @@ func TestMessageSeqNotBurnedByRetry(t *testing.T) {
 	}
 
 	// The proof: the next real message is 2, not 5.
-	next, created, err := srv.CreateMessage(ctx, conv.ID, sender.ID, "after the retries", nil)
+	next, created, err := srv.CreateMessage(ctx, conv.ID, sender.ID, sender.Username, "after the retries", nil)
 	if err != nil || !created {
 		t.Fatalf("CreateMessage(next) = created %v, err %v", created, err)
 	}
@@ -186,7 +186,7 @@ func TestListMessagesAfterSeq(t *testing.T) {
 	}
 
 	for _, text := range []string{"m1", "m2", "m3", "m4", "m5"} {
-		if _, created, err := srv.CreateMessage(ctx, conv.ID, sender.ID, text, nil); err != nil || !created {
+		if _, created, err := srv.CreateMessage(ctx, conv.ID, sender.ID, sender.Username, text, nil); err != nil || !created {
 			t.Fatalf("CreateMessage(%s) = created %v, err %v", text, created, err)
 		}
 	}
@@ -260,7 +260,7 @@ func TestMigrateBackfillsMessageSeq(t *testing.T) {
 	// Start from a clean slate: other tests leave rows behind, and this one
 	// counts exact numbers.
 	if err := s.db.WithContext(ctx).Exec(
-		`TRUNCATE messages, conversation_members, conversations RESTART IDENTITY`).Error; err != nil {
+		`TRUNCATE unread_counters, messages, conversation_members, conversations RESTART IDENTITY`).Error; err != nil {
 		t.Fatalf("truncate: %v", err)
 	}
 
@@ -339,7 +339,7 @@ func TestMigrateBackfillsMessageSeq(t *testing.T) {
 		}
 
 		// And prove it by sending one.
-		next, created, err := srv.CreateMessage(ctx, roomID, sender.ID, "after the migration", nil)
+		next, created, err := srv.CreateMessage(ctx, roomID, sender.ID, sender.Username, "after the migration", nil)
 		if err != nil || !created {
 			t.Fatalf("CreateMessage() after backfill = created %v, err %v", created, err)
 		}
@@ -350,7 +350,7 @@ func TestMigrateBackfillsMessageSeq(t *testing.T) {
 
 	// Leave a clean table for whatever runs next.
 	if err := s.db.WithContext(ctx).Exec(
-		`TRUNCATE messages, conversation_members, conversations RESTART IDENTITY`).Error; err != nil {
+		`TRUNCATE unread_counters, messages, conversation_members, conversations RESTART IDENTITY`).Error; err != nil {
 		t.Fatalf("cleanup truncate: %v", err)
 	}
 }

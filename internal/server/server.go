@@ -14,9 +14,11 @@ import (
 
 	_ "github.com/joho/godotenv/autoload"
 
+	"go-chat-backend/internal/broker"
 	"go-chat-backend/internal/cluster"
 	"go-chat-backend/internal/database"
 	"go-chat-backend/internal/metrics"
+	"go-chat-backend/internal/outbox"
 	"go-chat-backend/internal/ws"
 )
 
@@ -33,13 +35,21 @@ type Server struct {
 	// them. It is delivery only: the write path is still REST.
 	hub *ws.Hub
 
-	// cluster is Redis, and it is nil when REDIS_ADDR is not set.
+	// cluster is Redis, and it is nil when REDIS_ADDR is not set. Since Stage 5
+	// it does presence only.
 	//
 	// nil is a supported mode, not a broken one: it means "one node", and then
-	// the write path fans out straight to the local hub exactly as it did in
-	// Stage 2. That is what `make run` and every test uses, and it is why none
-	// of them need a Redis container.
+	// nobody is tracked as online. Delivery does not depend on it. That is what
+	// `make run` and every test uses, and it is why none of them need a Redis
+	// container.
 	cluster *cluster.Cluster
+
+	// broker is NATS, and it is nil when NATS_URL is not set.
+	//
+	// It is here only so /health can say whether it is reachable. Nothing in a
+	// request path touches it: the send path stops at the outbox row, and the
+	// relay owns everything after that.
+	broker *broker.Broker
 
 	// draining is set at the start of Shutdown, and makes /readyz fail, so a
 	// load balancer stops sending work to a node that is about to close.
@@ -55,11 +65,11 @@ type Server struct {
 }
 
 // App owns everything the process has to shut down: the HTTP server, the
-// WebSocket hub, and the database behind them.
+// WebSocket hub, the database, Redis and the broker.
 //
-// main only starts it and stops it. Every later stage adds one more thing that
-// must be closed in the right order — Redis, the broker — and that list
-// belongs next to the code that opened them, not in main.
+// main only starts it and stops it. The order things are closed in matters
+// more than the list itself, and it belongs next to the code that opened them,
+// not in main. See Shutdown.
 type App struct {
 	HTTP *http.Server
 
@@ -67,11 +77,15 @@ type App struct {
 	hub     *ws.Hub
 	db      database.Service
 	cluster *cluster.Cluster
+	broker  *broker.Broker
+	relay   *outbox.Relay
 
-	// The subscriber and the presence heartbeat run for the life of the
-	// process. stopBackground ends them, and background waits until they have
-	// really stopped — a goroutine still publishing presence for a node that is
-	// closing would keep dead users online.
+	// The relay, the two broker consumers and the presence heartbeat run for
+	// the life of the process. stopBackground ends them, and background waits
+	// until they have really stopped — a goroutine still publishing presence
+	// for a node that is closing would keep dead users online, and a relay
+	// killed mid-batch would leave its advisory lock to time out instead of
+	// handing it over.
 	stopBackground context.CancelFunc
 	background     sync.WaitGroup
 }
@@ -117,10 +131,19 @@ func New() *App {
 	// what happened when this exited instead.
 	redis := cluster.FromEnv(ctx)
 	if redis == nil {
-		log.Info("no REDIS_ADDR, running as a single node: sockets on other nodes will not be reached")
+		log.Info("no REDIS_ADDR, running as a single node: presence is not tracked")
 	} else {
 		// The node name is on every line already, from setupLogging.
-		log.Info("cluster mode", "redis", os.Getenv("REDIS_ADDR"))
+		log.Info("presence enabled", "redis", os.Getenv("REDIS_ADDR"))
+	}
+
+	// NATS, if there is any. A missing NATS_URL is single-node mode, and so is
+	// a NATS that will not answer — see broker.FromEnv. Neither stops the
+	// process, because writes do not depend on the broker: they land in the
+	// outbox, in Postgres, and go out when it comes back.
+	nats := broker.FromEnv(ctx)
+	if nats == nil {
+		log.Info("no NATS_URL, delivering locally: sockets on other nodes will not be reached")
 	}
 
 	// Publish the counters these already keep. Nothing is pushed: the values are
@@ -130,6 +153,9 @@ func New() *App {
 	metrics.RegisterDBPool(db)
 	if redis != nil {
 		metrics.RegisterCluster(redis)
+	}
+	if nats != nil {
+		metrics.RegisterBroker(nats)
 	}
 
 	limits := rateLimitsFromEnv().orDefaults()
@@ -147,9 +173,25 @@ func New() *App {
 
 		hub:     hub,
 		cluster: redis,
+		broker:  nats,
 
 		limits: limits,
 	}
+
+	// The relay, and where a drained row goes.
+	//
+	// With a broker, rows go onto the stream and come back to every node,
+	// including this one. Without a broker there is nobody to tell, so the
+	// same relay hands the event straight to this node's hub and does the
+	// unread work inline. One relay, one outbox, two last steps — see
+	// internal/outbox/local.go for why the single-node path was not just left
+	// in the handler.
+	var publisher outbox.Publisher = nats
+	if nats == nil {
+		publisher = outbox.NewLocalPublisher(s.deliverMessage, s.applyUnread)
+	}
+	relay := outbox.New(db, publisher, log)
+	metrics.RegisterOutbox(relay)
 
 	httpServer := &http.Server{
 		Addr:              fmt.Sprintf(":%d", s.port),
@@ -170,36 +212,57 @@ func New() *App {
 		ErrorLog: slog.NewLogLogger(log.Handler(), slog.LevelWarn),
 	}
 
-	app := &App{HTTP: httpServer, srv: s, hub: hub, db: db, cluster: redis}
+	app := &App{HTTP: httpServer, srv: s, hub: hub, db: db, cluster: redis, broker: nats, relay: relay}
 	app.startBackground()
 	return app
 }
 
-// startBackground starts the two goroutines that make this node part of a
-// cluster. With no Redis there is nothing to start.
+// startBackground starts the goroutines that run for the life of the process.
 //
-//  1. The subscriber. It is the ONLY thing that delivers a message to a socket
-//     now, including a message this very node published. One path in, so a
-//     message cannot arrive twice.
-//  2. The presence heartbeat.
+//  1. The relay. It runs on EVERY node, always, even with no broker and no
+//     Redis, because it is what turns a committed message into a delivered
+//     one. Only one node drains at a time; the rest wait on the lock. This is
+//     the one goroutine the service cannot work without.
+//  2. The fan-out consumer, with a broker. It is the only thing that delivers
+//     a message to a socket on a clustered node — including a message this
+//     very node's relay published. One path in, so a message cannot arrive
+//     twice.
+//  3. The unread consumer, with a broker. Shared with the other nodes.
+//  4. The presence heartbeat, with Redis.
 func (a *App) startBackground() {
 	ctx, cancel := context.WithCancel(context.Background())
 	a.stopBackground = cancel
+
+	a.background.Add(1)
+	go func() {
+		defer a.background.Done()
+		a.relay.Run(ctx)
+	}()
+
+	if a.broker != nil {
+		a.background.Add(2)
+
+		go func() {
+			defer a.background.Done()
+			// deliverMessage is exactly the callback shape SubscribeFanout
+			// wants, and that is not a coincidence: the hub was written in
+			// Stage 1 so that a transport could plug in beside it and not
+			// inside it. Redis did in Stage 3; NATS does now; neither package
+			// knows what a socket is.
+			a.broker.SubscribeFanout(ctx, a.srv.deliverMessage)
+		}()
+
+		go func() {
+			defer a.background.Done()
+			a.broker.ConsumeUnread(ctx, a.srv.applyUnread)
+		}()
+	}
 
 	if a.cluster == nil {
 		return
 	}
 
-	a.background.Add(2)
-
-	go func() {
-		defer a.background.Done()
-		// hub.Broadcast is exactly the callback shape Subscribe wants, and that
-		// is not a coincidence: the hub was written in Stage 1 so that Redis
-		// could plug in beside it and not inside it.
-		a.cluster.Subscribe(ctx, a.hub.Broadcast)
-	}()
-
+	a.background.Add(1)
 	go func() {
 		defer a.background.Done()
 		a.runPresence(ctx)
@@ -261,14 +324,23 @@ func (a *App) Shutdown(ctx context.Context) error {
 	httpErr := a.HTTP.Shutdown(ctx)
 
 	// The background goroutines go after the requests and before the hub. A
-	// request still finishing may publish a fan-out, and the subscriber is what
-	// delivers it — stopping the subscriber first would drop the last messages
-	// of a draining node.
+	// request still finishing writes an outbox row, and the relay is what
+	// sends it — stopping the relay first would leave the last messages of a
+	// draining node in the table until another node's relay noticed.
+	//
+	// They are also what makes shutdown clean rather than merely quick: the
+	// relay releases its advisory lock on the way out, so the next leader
+	// starts in seconds instead of waiting for Postgres to notice a dead
+	// connection.
 	//
 	// Stopping the heartbeat here is also what takes this node's users offline:
 	// nobody refreshes them, so within one PresenceTTL they fall out of the
 	// window on their own. There is no goodbye message to send, which is the
 	// point — a crash cannot send one either.
+	//
+	// Nothing is lost if this node is killed before any of it happens. That is
+	// the whole reason the outbox exists: the instruction to deliver is a row
+	// in Postgres, and another node picks it up.
 	if a.stopBackground != nil {
 		a.stopBackground()
 	}
@@ -276,10 +348,11 @@ func (a *App) Shutdown(ctx context.Context) error {
 
 	a.hub.Close()
 
+	brokerErr := a.broker.Close()
 	redisErr := a.cluster.Close()
 	dbErr := a.db.Close()
 
 	// errors.Join keeps every problem instead of hiding some, and returns nil
 	// when they are all nil.
-	return errors.Join(httpErr, redisErr, dbErr)
+	return errors.Join(httpErr, brokerErr, redisErr, dbErr)
 }

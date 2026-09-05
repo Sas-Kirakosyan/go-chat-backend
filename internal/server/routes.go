@@ -158,6 +158,7 @@ func (s *Server) RegisterRoutes() *gin.Engine {
 		conversations.POST("/:id/members", s.AddMemberHandler)
 		conversations.POST("/:id/messages", s.SendMessageHandler)
 		conversations.GET("/:id/messages", s.ListMessagesHandler)
+		conversations.POST("/:id/read", s.MarkReadHandler)
 		conversations.GET("/:id/presence", s.PresenceHandler)
 	}
 

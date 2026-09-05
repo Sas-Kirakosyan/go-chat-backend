@@ -1,46 +1,18 @@
 package cluster
 
 import (
-	"encoding/json"
 	"strings"
 	"testing"
 	"time"
 )
 
 // These tests need no Redis. What they check is the part that would be wrong
-// on every machine equally: the shape of what travels between nodes, and the
-// string handling around presence. Anything that needs a real server is
-// checked by hand in the Stage 3 notes, with cmd/splitcheck.
-
-// The payload must stay JSON on the wire. If fanout.Payload were []byte instead
-// of json.RawMessage, encoding/json would base64 it: the traffic would grow by
-// a third and `redis-cli SUBSCRIBE chat:fanout` would show gibberish.
-func TestFanoutKeepsPayloadReadable(t *testing.T) {
-	payload := []byte(`{"type":"message.new","data":{"id":7}}`)
-
-	raw, err := json.Marshal(fanout{UserIDs: []uint{1, 2}, Payload: payload, From: "api1"})
-	if err != nil {
-		t.Fatalf("marshal: %v", err)
-	}
-
-	if !strings.Contains(string(raw), `"type":"message.new"`) {
-		t.Fatalf("payload was re-encoded, not embedded: %s", raw)
-	}
-
-	var back fanout
-	if err := json.Unmarshal(raw, &back); err != nil {
-		t.Fatalf("unmarshal: %v", err)
-	}
-	if string(back.Payload) != string(payload) {
-		t.Fatalf("payload changed:\n got %s\nwant %s", back.Payload, payload)
-	}
-	if len(back.UserIDs) != 2 || back.UserIDs[0] != 1 || back.UserIDs[1] != 2 {
-		t.Fatalf("user ids changed: %v", back.UserIDs)
-	}
-	if back.From != "api1" {
-		t.Fatalf("from: got %q, want %q", back.From, "api1")
-	}
-}
+// on every machine equally: the string handling around presence. Anything that
+// needs a real server is checked by hand in the Stage 3 notes, with
+// cmd/splitcheck.
+//
+// The fan-out test that used to live here moved to internal/broker with the
+// fan-out itself, in Stage 5.
 
 func TestPresenceMemberRoundTrip(t *testing.T) {
 	cases := []struct {

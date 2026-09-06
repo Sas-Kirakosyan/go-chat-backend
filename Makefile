@@ -12,6 +12,17 @@ build:
 # Run the application
 run:
 	@go run cmd/api/main.go
+
+# The dev client: web/index.html on http://localhost:5173.
+#
+# It has to be served, not opened as a file. The API allows exactly one browser
+# origin — http://localhost:5173 — for CORS and for the WebSocket handshake.
+#
+#   make run    # terminal 1: the API on :8080
+#   make web    # terminal 2: this
+#   make seed ARGS="-n 3"   # accounts to log in with
+web:
+	@go run ./cmd/web $(ARGS)
 # Seed the database with test users (override with e.g. `make seed ARGS="-n 20"`)
 seed:
 	@go run cmd/seed/main.go $(ARGS)
@@ -186,6 +197,6 @@ watch:
 		Write-Output 'Watching...'; \
 	}"
 
-.PHONY: all build run seed wsload splitcheck gapcheck outboxcheck clean watch docker-run docker-down \
+.PHONY: all build run web seed wsload splitcheck gapcheck outboxcheck clean watch docker-run docker-down \
 	test test-v test-one test-race itest cover \
 	migrate-status migrate-up migrate-down migration

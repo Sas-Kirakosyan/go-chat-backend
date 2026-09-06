@@ -1419,6 +1419,44 @@ Forgetting that is an easy hour to lose: plain `make seed` reads `.env`, writes
 to the database on `localhost:5432`, and reports success — into a database the
 cluster is not using. The logins then fail with `401` and nothing explains why.
 
+### The dev client
+
+[`web/index.html`](web/index.html) is a browser client for this API: one file,
+no build step, no framework. It logs in, lists rooms, shows history, sends
+messages and holds a socket open.
+
+```bash
+make run                # terminal 1: the API on :8080
+make web                # terminal 2: the page on :5173
+make seed ARGS="-n 3"   # accounts: testuser001 / password123
+```
+
+It has to be served, not opened from disk. A `file://` page sends
+`Origin: null`, which the CORS config refuses for REST and `CheckOrigin`
+refuses for the socket — an error that looks like a broken backend and is not
+one. `make web` runs [`cmd/web`](cmd/web), a static file server on the one
+origin both checks allow.
+
+The right-hand panel is why it exists. It prints every call the page makes and
+every frame the socket delivers, so the parts of this README that are otherwise
+only prose can be watched happening:
+
+| Do this | Watch this |
+| ------- | ---------- |
+| Open two browser profiles, log in as two users of one room | one `POST`, two `message.new` frames |
+| Send a message | the `POST` returns `seq=N`, and the socket pushes the same `seq` back — the page drops the copy |
+| Stop the API for ten seconds while the other user sends | `socket closed`, then on reconnect `recovered N messages after seq …` |
+| `docker compose kill nats`, then send | the send still answers, and the frame arrives late — after `docker compose start nats` |
+| Leave a room and let someone write in it | the unread badge appears, written by the broker consumer, not by the sender's request |
+
+Two users need two browser profiles or one private window, because the login is
+per browser. Create a room, read the ids in the room header, and add the other
+user with **Add member**.
+
+The client is deliberately small, and it leaves things out: no scroll-back
+paging with `?before_id=`, no presence, no typing state, no message list per
+room kept in memory. It has the pieces needed to see the delivery path work.
+
 ## MakeFile
 
 Run build make command with tests

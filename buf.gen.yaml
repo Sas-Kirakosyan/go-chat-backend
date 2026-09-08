@@ -1,0 +1,13 @@
+version: v2
+
+plugins:
+  # `module=` trims the Go module path off the front of go_package, so the file
+  # declared as "go-chat-backend/internal/presencepb" is written to
+  # internal/presencepb/ and not to a nested go-chat-backend/ directory.
+  - local: protoc-gen-go
+    out: .
+    opt: module=go-chat-backend
+
+  - local: protoc-gen-go-grpc
+    out: .
+    opt: module=go-chat-backend

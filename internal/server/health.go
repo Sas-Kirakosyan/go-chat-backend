@@ -42,12 +42,17 @@ func (s *Server) livezHandler(c *gin.Context) {
 //  2. The database is unreachable. Nearly every route needs it, so answering
 //     them here would only produce 500s.
 //
-// Redis and NATS are deliberately NOT checked, even though live delivery
-// depends on NATS. Both are shared by every node, so an outage of either would
-// fail this probe on all of them at once, the load balancer would take the
-// whole service out, and users would lose login, history and sending — none of
-// which need either one. A shared dependency in a readiness probe turns one
-// broken thing into a total outage.
+// The presence service and NATS are deliberately NOT checked, even though live
+// delivery depends on NATS. Both are shared by every node, so an outage of
+// either would fail this probe on all of them at once, the load balancer would
+// take the whole service out, and users would lose login, history and sending —
+// none of which need either one. A shared dependency in a readiness probe turns
+// one broken thing into a total outage.
+//
+// Stage 6 makes that rule easier to break, which is why it is worth restating.
+// A second service is a thing with its own deploys and its own bad days, and
+// the temptation to say "we cannot serve without presence" is exactly how one
+// team's rollback becomes everybody's outage.
 //
 // The outbox is what makes that safe to say now rather than merely bearable. A
 // send with NATS down still commits, and the row waits in Postgres until the
@@ -75,15 +80,21 @@ func (s *Server) readyzHandler(c *gin.Context) {
 func (s *Server) healthHandler(c *gin.Context) {
 	stats := s.db.Health()
 
-	// Redis and NATS appear here and nowhere else. This is the page a person
-	// opens when "my friend on the other node sees nothing", and one of these
-	// two lines usually answers it. Neither changes the status code: the node
-	// is serving fine, it just cannot reach the other nodes.
+	// The two other services appear here and nowhere else. This is the page a
+	// person opens when "my friend on the other node sees nothing", and one of
+	// these two lines usually answers it. Neither changes the status code: the
+	// node is serving fine, it just cannot reach something it shares.
 	//
-	// nats:"down" is the one to read first now. Redis being down costs
-	// presence; NATS being down costs live delivery, and the messages are
+	// nats:"down" is the one to read first. Presence being down costs one
+	// endpoint; NATS being down costs live delivery, and the messages are
 	// piling up in the outbox until it returns.
-	stats["redis"] = s.redisStatus(c)
+	//
+	// The presence line carries the circuit breaker's state as well as the
+	// answer, because those are two different facts. "down" says presence did
+	// not answer just now. "open" says this node stopped asking a while ago and
+	// is failing those calls itself, which is the state to be in during an
+	// outage and a confusing one to meet without a label.
+	stats["presence"] = s.presenceStatus(c)
 	stats["nats"] = s.natsStatus(c)
 
 	if stats["status"] != "up" {
@@ -93,14 +104,14 @@ func (s *Server) healthHandler(c *gin.Context) {
 	c.JSON(http.StatusOK, stats)
 }
 
-func (s *Server) redisStatus(c *gin.Context) string {
-	if s.cluster == nil {
-		return "not configured (no presence)"
+func (s *Server) presenceStatus(c *gin.Context) string {
+	if s.presence == nil {
+		return "not configured (single node, online means a socket here)"
 	}
-	if err := s.cluster.Ping(c.Request.Context()); err != nil {
-		return "down: " + err.Error()
+	if err := s.presence.Ping(c.Request.Context()); err != nil {
+		return "down: " + err.Error() + " (breaker " + s.presence.BreakerState() + ")"
 	}
-	return "up"
+	return "up (breaker " + s.presence.BreakerState() + ")"
 }
 
 func (s *Server) natsStatus(c *gin.Context) string {

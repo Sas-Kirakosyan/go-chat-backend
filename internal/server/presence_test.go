@@ -10,10 +10,13 @@ import (
 )
 
 // These run in single-node mode, where "online" means "has a socket on this
-// node". The cluster answer goes through Redis and is checked by hand with
-// cmd/splitcheck; what is checked here is everything around it — the member
-// check, the two lists, and that opening and closing a socket really moves a
-// user between them.
+// node". The cluster answer goes through the presence service over gRPC and is
+// checked by hand with cmd/presencecheck; what is checked here is everything
+// around it — the member check, the two lists, and that opening and closing a
+// socket really moves a user between them.
+//
+// The helper is roomPresence and not presence, because internal/presence is a
+// package this file's package now imports.
 
 func TestPresenceListsMembersAsOffline(t *testing.T) {
 	_, _, r := newWSTestServer(t)
@@ -21,7 +24,7 @@ func TestPresenceListsMembersAsOffline(t *testing.T) {
 	_, bobID := signUp(t, r, "bob")
 	roomID := newRoom(t, r, alice, bobID)
 
-	got := presence(t, r, roomID, alice)
+	got := roomPresence(t, r, roomID, alice)
 
 	if len(got.Online) != 0 {
 		t.Fatalf("online: got %v, want nobody — no socket is open", got.Online)
@@ -39,7 +42,7 @@ func TestPresenceFollowsTheSocket(t *testing.T) {
 
 	conn := connect(t, srv, alice)
 
-	got := presence(t, r, roomID, alice)
+	got := roomPresence(t, r, roomID, alice)
 	if len(got.Online) != 1 || got.Online[0] != aliceID {
 		t.Fatalf("online: got %v, want [%d]", got.Online, aliceID)
 	}
@@ -93,7 +96,7 @@ func newRoom(t *testing.T, r *gin.Engine, authHeader string, memberIDs ...uint) 
 	return room.ID
 }
 
-func presence(t *testing.T, r *gin.Engine, roomID uint, authHeader string) presenceDTO {
+func roomPresence(t *testing.T, r *gin.Engine, roomID uint, authHeader string) presenceDTO {
 	t.Helper()
 
 	rr := do(t, r, "GET", fmt.Sprintf("/conversations/%d/presence", roomID), "", authHeader)
@@ -117,7 +120,7 @@ func waitUntilOffline(t *testing.T, r *gin.Engine, roomID uint, authHeader strin
 
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
-		if len(presence(t, r, roomID, authHeader).Online) == 0 {
+		if len(roomPresence(t, r, roomID, authHeader).Online) == 0 {
 			return
 		}
 		time.Sleep(20 * time.Millisecond)

@@ -1,4 +1,4 @@
-package cluster
+package presence
 
 import (
 	"strings"
@@ -6,32 +6,31 @@ import (
 	"time"
 )
 
-// These tests need no Redis. What they check is the part that would be wrong
-// on every machine equally: the string handling around presence. Anything that
-// needs a real server is checked by hand in the Stage 3 notes, with
-// cmd/splitcheck.
+// These tests need no Redis. What they check is the part that would be wrong on
+// every machine equally: the string handling around presence. Anything that
+// needs a real server is checked by hand with cmd/presencecheck.
 //
-// The fan-out test that used to live here moved to internal/broker with the
-// fan-out itself, in Stage 5.
+// They came from internal/cluster, which Stage 6 deleted along with the API
+// node's Redis client.
 
-func TestPresenceMemberRoundTrip(t *testing.T) {
+func TestMemberRoundTrip(t *testing.T) {
 	cases := []struct {
 		name   string
 		member string
-		want   uint
+		want   uint64
 		ok     bool
 	}{
-		{"plain", presenceMember(42, "api1"), 42, true},
+		{"plain", member(42, "api1"), 42, true},
 		// A node id with a colon in it is the realistic hostname case, e.g. an
 		// IPv6 address. Cutting at the first colon is what keeps this working.
-		{"node id with colons", presenceMember(42, "fe80::1"), 42, true},
+		{"node id with colons", member(42, "fe80::1"), 42, true},
 		{"no colon", "42", 0, false},
 		{"not a number", "abc:api1", 0, false},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got, ok := parsePresenceMember(tc.member)
+			got, ok := parseMember(tc.member)
 			if ok != tc.ok {
 				t.Fatalf("ok: got %v, want %v (member %q)", ok, tc.ok, tc.member)
 			}
@@ -53,5 +52,14 @@ func TestScoreIsNotScientificNotation(t *testing.T) {
 	}
 	if want := "1788004800"; got != want {
 		t.Fatalf("score: got %s, want %s", got, want)
+	}
+}
+
+// Three heartbeats have to fit inside one TTL. If they did not, a single lost
+// beat would blink a whole node's users offline, and a lost beat is a normal
+// event — it happens on every deploy of the presence service.
+func TestHeartbeatFitsInsideTheTTL(t *testing.T) {
+	if Heartbeat*3 > TTL {
+		t.Fatalf("heartbeat %s does not fit three times into TTL %s", Heartbeat, TTL)
 	}
 }

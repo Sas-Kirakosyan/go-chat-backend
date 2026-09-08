@@ -13,6 +13,16 @@ build:
 run:
 	@go run cmd/api/main.go
 
+# Stage 6: the presence service, on its own.
+#
+# `make run` alone needs none of this — with no PRESENCE_ADDR the API answers
+# presence from its own hub. Run both when you want the split locally:
+#
+#   make presenced                          # terminal 1, needs a Redis
+#   PRESENCE_ADDR=localhost:9090 make run   # terminal 2
+presenced:
+	@go run ./cmd/presenced $(ARGS)
+
 # The dev client: web/index.html on http://localhost:5173.
 #
 # It has to be served, not opened as a file. The API allows exactly one browser
@@ -86,6 +96,25 @@ gapcheck:
 outboxcheck:
 	@go run ./cmd/outboxcheck $(ARGS)
 
+# Stage 6: prove that killing the presence service costs one endpoint and
+# nothing else — and watch the circuit breaker turn a slow failure into an
+# instant one.
+#
+# Run it once plain, to see both nodes agree on who is online. Then run it with
+# a pause and kill presenced during it. Two things to watch in the table: the
+# presence column goes from ~1s failures to microsecond failures once the
+# breaker opens, and the chat column never changes at all.
+#
+#   docker compose up --build -d
+#   make seed ARGS="-n 2"
+#   make presencecheck
+#
+#   make presencecheck ARGS="-pause 40s"
+#   docker compose kill presenced      # during the pause
+#   docker compose start presenced     # 15 seconds later
+presencecheck:
+	@go run ./cmd/presencecheck $(ARGS)
+
 # Migrations. The server applies them itself on startup; these are for looking
 # before you leap, and for stepping back after a mistake.
 migrate-status:
@@ -110,6 +139,36 @@ migrate-down:
 migration:
 	@go run github.com/pressly/goose/v3/cmd/goose@v3.26.0 -s \
 		-dir internal/database/migrations create $(NAME) sql
+
+# Regenerate the gRPC code from proto/.
+#
+# The generated files are committed, so building and testing this repo needs
+# none of this — run it only after editing a .proto.
+#
+# Everything here is a Go program, on purpose: buf is the protobuf compiler
+# (protoc is a C++ binary that has to be installed and kept in step by hand),
+# and the two plugins are what turn the .proto into Go. `go install` puts them
+# in GOBIN, which has to be on PATH for buf to find them.
+#
+# `buf lint` runs first because a naming mistake is much easier to read here
+# than in the generated code, and `buf breaking` is the one that matters once
+# something is deployed: it compares against the committed version and fails on
+# a change that would break a client which has not been rebuilt.
+PROTOC_GEN_GO_VERSION ?= v1.36.11
+PROTOC_GEN_GO_GRPC_VERSION ?= v1.5.1
+BUF_VERSION ?= v1.47.2
+
+proto:
+	@go install google.golang.org/protobuf/cmd/protoc-gen-go@$(PROTOC_GEN_GO_VERSION)
+	@go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@$(PROTOC_GEN_GO_GRPC_VERSION)
+	@go run github.com/bufbuild/buf/cmd/buf@$(BUF_VERSION) lint
+	@go run github.com/bufbuild/buf/cmd/buf@$(BUF_VERSION) generate
+	@go mod tidy
+
+# Would this change break a client that has not been rebuilt? Compares the
+# working tree against the last commit on main.
+proto-breaking:
+	@go run github.com/bufbuild/buf/cmd/buf@$(BUF_VERSION) breaking --against '.git#branch=main'
 
 # Create DB container
 docker-run:
@@ -197,6 +256,7 @@ watch:
 		Write-Output 'Watching...'; \
 	}"
 
-.PHONY: all build run web seed wsload splitcheck gapcheck outboxcheck clean watch docker-run docker-down \
+.PHONY: all build run presenced web seed wsload splitcheck gapcheck outboxcheck presencecheck \
+	clean watch docker-run docker-down proto proto-breaking \
 	test test-v test-one test-race itest cover \
 	migrate-status migrate-up migrate-down migration

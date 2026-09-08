@@ -8,12 +8,16 @@ CORS is configured for a frontend on `http://localhost:5173`.
 
 ## Status
 
+**[`docs/architecture.md`](docs/architecture.md) is the picture of all of it**:
+every process, the route a message takes, and what breaks when each part dies.
+Read that first if you want the shape before the reasoning.
+
 Authentication with refresh-token sessions, the conversation REST API, the
 WebSocket delivery layer, and the observability and safety work around them are
 implemented and tested.
 
-Delivery runs across **two nodes behind nginx**, with presence in Redis and a
-per-node view on `/metrics` — see [Two nodes](#two-nodes).
+Delivery runs across **two nodes behind nginx**, with a per-node view on
+`/metrics` — see [Two nodes](#two-nodes).
 
 Every message carries a **per-room sequence number**, so a client that loses
 its socket can see exactly what it missed and ask for it. Delivery is
@@ -26,9 +30,16 @@ broker and sends still answer 201; the messages queue in Postgres and go out
 when it comes back. A consumer on the same stream keeps unread counters, with
 retries and a dead-letter queue — see [The outbox and the broker](#the-outbox-and-the-broker).
 
+Presence is now a **second service**, `presenced`, reached over gRPC. The API
+nodes have no Redis client any more; they ask. Kill it and the product loses one
+endpoint and nothing else, and after five failed calls a circuit breaker turns
+a one-second timeout into a five-millisecond refusal — see
+[A second service](#a-second-service).
+
 Still missing: the relay polls, so live delivery costs up to 100ms more than it
-did. Postgres `LISTEN/NOTIFY` would remove that, and there is no second service
-yet — everything still runs in one binary. That split is the next stage.
+did — Postgres `LISTEN/NOTIFY` would remove that. And a message crossing four
+processes still has no single id following it, so a slow step has to be found by
+reading four logs side by side. Tracing is the next stage.
 
 ## Endpoints
 
@@ -462,8 +473,18 @@ another service.
 | `chat_broker_redelivered_total` | counter | at-least-once delivery, visible |
 | `chat_broker_dead_lettered_total` | counter | should be flat at zero |
 | `chat_unread_applied_total`, `chat_unread_duplicates_total` | counters | consumer work done, and redeliveries correctly ignored |
+| `chat_presence_calls_total`, `chat_presence_failures_total` | counters | the error rate of the presence service, as this node experienced it |
+| `chat_presence_retries_total` | counter | the early warning: it rises while calls still succeed |
+| `chat_presence_short_circuited_total` | counter | calls the breaker refused without touching the network |
+| `chat_presence_breaker_open` | gauge | 1 when this node has cut presence off, 0.5 while probing |
+| `chat_presence_store_failures_total` | counter | **on `presenced`, not here**: Redis commands the service itself could not complete |
 
-Two of those deserve an alert, and neither has an HTTP symptom — a broken
+The last two rows are a pair worth reading together. When the API nodes report
+failures and `presenced` reports none, the problem is between them — or the
+calls never left, which is what `short_circuited_total` says. That is a question
+you can only answer by measuring both sides of a boundary.
+
+Two of these deserve an alert, and neither has an HTTP symptom — a broken
 cluster still answers `201` to every send:
 
 - `chat_outbox_lag_seconds` above a few seconds means messages are written and
@@ -473,6 +494,9 @@ cluster still answers `201` to every send:
 - `sum(chat_outbox_relay_leader)` other than 1. Zero means nobody is draining.
   Two means the advisory lock is broken and one room's messages are going out
   in the wrong order.
+- `chat_presence_breaker_open` at 1 means this node has stopped asking about
+  presence at all. Unlike a slow dependency it will not fix itself in the
+  graphs, because no calls are being made to fail.
 
 The Go runtime and process collectors come free with the default registry.
 `go_goroutines` is the one to watch here: this service runs **two goroutines
@@ -536,6 +560,13 @@ and when the database comes back they are put in again on their own.
 `/livez` deliberately checks nothing. Its answer arriving *is* the check: the
 process is up, the accept loop works, and a goroutine got scheduled to write
 it.
+
+`presenced` answers the same three questions in two places: `/livez` and
+`/metrics` on its HTTP port, and the readiness question on the gRPC port
+through the standard `grpc.health.v1.Health` service. Two ports, because a gRPC
+server cannot serve a Prometheus text page — but the health answer stays on the
+gRPC port on purpose, since a probe that goes through a different server can be
+perfectly happy while the port that matters is wedged.
 
 `/readyz` also fails at the **start** of shutdown, before the drain, so a load
 balancer stops sending new requests to a node that is about to close. Without
@@ -732,6 +763,11 @@ cheap: a node drops any fan-out whose users it does not hold.
 the cluster. It is a Redis sorted set: member `userID:nodeID`, score the unix
 time that node last saw them. Online means "score newer than 30 seconds ago".
 
+> Stage 6 moved this behind its own service. The data shape below did not
+> change one line; what changed is who reads it — the API nodes now ask
+> `presenced` over gRPC instead of holding a Redis client. See
+> [A second service](#a-second-service).
+
 Everything about that shape is chosen for one case — **a node that dies without
 saying goodbye**:
 
@@ -770,6 +806,11 @@ addresses whose header is believed. Unset, it means *trust nobody* — the clien
 IP is the TCP address — which is the right answer for `make run`.
 
 ### Measured: what happens when Redis stops
+
+> This is a Stage 3 measurement, kept because the lessons in it are what the
+> later stages were built on. Redis is no longer reachable from an API node at
+> all: it sits behind `presenced`, and the equivalent run today is
+> [killing that service](#measured-what-an-outage-of-the-second-service-costs).
 
 The interesting run is the failure one. Both nodes up, `docker compose stop
 redis`, then measure every path.
@@ -821,8 +862,9 @@ That last one is the same rule as `/readyz`, which deliberately checks
 **neither** Redis nor NATS. Both are shared by every node, so an outage of
 either would fail the probe on all of them at once and the load balancer would
 take the whole service out. A shared dependency in a readiness probe turns one
-broken thing into an outage. `/health` reports `redis: down` and `nats: down`
-for the human, and the status code stays 200.
+broken thing into an outage. `/health` reports the shared dependencies for the
+human — today that reads `presence: down (breaker open)` and `nats: down` — and
+the status code stays 200.
 
 Recovery needs no restart in either case. `docker compose start redis`, and
 presence answers again within a couple of seconds.
@@ -1188,6 +1230,207 @@ none of it moved". `Drain` now reports both numbers, and the second case backs
 off for five seconds instead of 100 ms. The same outage now produces **8
 attempts in 97 seconds**.
 
+## A second service
+
+Everything up to here was one binary running twice. Presence is now its own
+process, [`cmd/presenced`](cmd/presenced), and the API nodes reach it over gRPC.
+
+### Why presence, and why not something bigger
+
+Splitting the wrong thing is the expensive mistake, so it is worth being able to
+say why this one was safe:
+
+- **Nothing joins to it.** No route reads presence and a message in one query,
+  no transaction spans them, no table has a foreign key to it. The split costs
+  no join and no distributed transaction.
+- **The product survives without it.** A chat with no green dots is a chat. A
+  chat that cannot store a message is not.
+- **It is not on the write path.** Splitting messages out would have put a
+  network call between the user and their message being saved, which is a much
+  worse first split — a write path that can fail in a new way.
+
+The boundary turned out to be real and not a naming convention. An API node no
+longer has a Redis client at all, so it cannot read or write the presence key
+even by mistake; `presenced` has no database, no JWT secret and no NATS, so it
+cannot touch a message. Each process can only do its own job.
+
+### The contract
+
+[`proto/presence/v1/presence.proto`](proto/presence/v1/presence.proto) is the
+whole agreement: two unary RPCs, `Heartbeat` and `Online`.
+
+Writing it down changed one thing immediately. While presence was a Go method,
+the compiler checked every caller and a rename was a refactor. Now the caller
+and the callee are deployed separately, so during any rolling deploy an old API
+node is talking to a new service — which is why the package is `presence.v1`,
+and why `make proto-breaking` fails a change that would break a client that has
+not been rebuilt.
+
+The generated code is committed, so building this repo needs no protobuf
+toolchain. `make proto` regenerates it, and everything it runs is a Go program:
+[buf](https://buf.build) instead of `protoc`, because `protoc` is a C++ binary
+that has to be installed and kept in step by hand.
+
+Two small decisions in that file are worth naming:
+
+- `Heartbeat` sends **the whole list** of users on the node, every time, not a
+  delta. A node that missed a beat repairs itself with the next one.
+- There is **no goodbye call**, and that is the design. The one moment a node
+  cannot send one is the moment it is killed, which is exactly the case presence
+  has to survive. Entries expire on their own instead.
+
+### Three things the network added
+
+A function call cannot be slow for a reason that has nothing to do with you,
+cannot half-succeed, and cannot be answered by a version of the code you were
+not compiled against. An RPC can do all three, and
+[`internal/presence/client.go`](internal/presence/client.go) is one answer per
+problem.
+
+**A deadline, shared by every attempt.** One second for `Online` — the same
+budget the in-process version had — and it covers the retries too. A deadline
+that resets on each retry is not a deadline; it is how a page that promises to
+answer in one second answers in three. gRPC puts the remaining time on the wire,
+so the service knows how long the caller is prepared to wait and stops working
+on a request nobody is listening for.
+
+**Retries, but only three and only for one code.** `Unavailable` means "this may
+work in a moment": a connection dropped mid-deploy, an instance restarting.
+Everything else is repeated for nothing — `Unimplemented` in particular, which
+is what an old service returns for a new method, and hammering it will not
+upgrade it. The wait between attempts is **full jitter**: without randomness
+every node in the fleet retries at the same two moments after a shared failure,
+and a service coming back is met by everybody at once.
+
+**A circuit breaker, outside the retry loop.** Retries are what make a
+struggling service dead, so the breaker has to sit in front of them, not inside.
+Five consecutive failures open it; for five seconds after that a call returns at
+once with no connection and no packet. Then exactly one call is let through as a
+probe — one, because a recovering service must not be hit by every waiting
+caller the moment it answers. A failed probe reopens it for another full five
+seconds, which is what stops "open" from decaying into "every request tries
+again".
+
+### Measured: what an outage of the second service costs
+
+`make presencecheck ARGS="-pause 50s"` polls presence once a second, sends a
+message every fifth probe, and prints what each one cost. `docker compose kill
+presenced` during it:
+
+```
+    time  presence on node A                          chat
+      2s  A online  B online                   7ms    
+      3s  FAILED 503 Service Unavailable:    1.006s
+      5s  FAILED 503 Service Unavailable:    1.006s
+      7s  FAILED 503 Service Unavailable:    1.005s   sent+delivered in 14ms
+      9s  FAILED 503 Service Unavailable:    1.005s
+     11s  FAILED 503 Service Unavailable:    1.005s
+     13s  FAILED 503 Service Unavailable:       5ms
+     14s  FAILED 503 Service Unavailable:       4ms
+     15s  FAILED 503 Service Unavailable:       5ms   sent+delivered in 17ms
+     18s  FAILED 503 Service Unavailable:    1.006s
+     20s  FAILED 503 Service Unavailable:       5ms
+     ...
+     29s  A OFFLINE B online                   8ms
+     39s  A online  B online                   8ms
+```
+
+Four numbers in that table:
+
+| | |
+| --- | --- |
+| Cost of a failure, breaker closed | **1.006 s** — the client deadline, paid in full |
+| Cost of a failure, breaker open | **4–7 ms** — and that is the HTTP round trip to the API node; the gRPC call never happens |
+| Failures before it opens | **5**, so about 5 seconds of a service being down |
+| Messages lost, sent or delayed | **0** — 9 sent, 9 delivered, 8–18 ms throughout |
+
+The single 1.006 s spike at 18 s is the half-open probe: one call let out,
+blocking for its whole deadline, failing, and closing the door again.
+
+The chat column is the one that matters most. It does not move — not one
+millisecond, not one error — because nothing on the write or delivery path knows
+that presence exists.
+
+`/metrics` on the two nodes tells the rest of the story, and the disagreement in
+it is the useful part:
+
+```
+api1   calls_total 55   failures_total 8   short_circuited_total 15
+api2   calls_total 26   failures_total 2   short_circuited_total 0
+presenced   store_failures_total 0
+```
+
+`presenced` recorded no failures at all, because it was not running to record
+any — the errors were on the caller's side of the wire, and 15 of the requests
+never left `api1`. That gap between the client's numbers and the server's is
+what says "this was a transport or breaker problem" rather than "Redis is
+broken", and it is only visible because both sides are measured.
+
+The second row is the surprise: **api2's breaker never opened.** It was being
+asked nothing — the probes all went to api1 — so its only presence traffic was
+one heartbeat every ten seconds, and two failures is not five. A breaker learns
+from traffic, so a quiet node stays ignorant, and the first user to ask it a
+question pays the full timeout. That is not a bug, but it is the reason the
+heartbeat is a good thing to have running: on a node with real users it keeps
+the breaker informed for free.
+
+### What broke, and what it taught
+
+**The circuit breaker did nothing at all, and every test passed.** The first
+outage run showed every failed request costing 1.006 s, for the whole twenty
+seconds, with the breaker still closed. The cause was one line of reasoning that
+reads perfectly sensibly:
+
+```go
+if !retryable(err) {
+    c.breaker.success()   // "the service answered and said no"
+    return err
+}
+```
+
+That is true of every gRPC code except one. **Nobody answers a deadline.** A
+dead service produced `DeadlineExceeded` on every call, each was booked as a
+success, and the breaker never counted a single failure. The protection existed,
+was configured, was unit-tested — and covered nothing, because the tests all ran
+against a server that answered.
+
+The fix is that "did this fail?" and "did the service reply?" are two different
+questions. `Unavailable`, `DeadlineExceeded` and `Canceled` mean nobody replied;
+everything else means the service was reached and had an opinion, and must not
+count against it — otherwise a bug in one of our own requests would cut off a
+dependency that is working perfectly.
+
+There is a third case the fix had to add: a caller who gave up first. A
+cancelled request says nothing about presence, so it is neither a success nor a
+failure. Without that, a page full of impatient clients could open the breaker
+on a healthy service.
+
+**Recovery is slower than the outage suggests.** After `presenced` came back,
+user A stayed *offline* for another **ten seconds** — visible at 29 s to 39 s in
+the table above. Three waits add up: the node's breaker has to reach its probe,
+the probe has to succeed, and then the next heartbeat has to actually run. None
+of them is wrong, and the sum is a thing to know before promising anybody that
+presence is instant.
+
+**A `depends_on` almost undid the whole stage.** The obvious compose entry is
+`presenced: condition: service_healthy` on each API node. It would have made the
+central claim false: an API node must start while presence is down. It is
+`service_started`, and the gRPC connection is made lazily on the first call, so
+a node that starts first simply picks presence up when it appears.
+
+### What it costs
+
+Presence used to be one Redis round trip inside the process: about **1 ms**. It
+is now a gRPC call to another process that does that same round trip: **4–9 ms**
+end to end through the API. Four to nine times slower for the same answer, and
+that is the honest price of a service boundary — one that buys nothing at this
+size, because there is exactly one caller and one implementation.
+
+What it buys is real but it is not performance: presence can be deployed,
+scaled, and broken without touching the chat, and the code proves it rather than
+promising it. On a service with three teams that is worth a great deal. On this
+one it is worth doing once, deliberately, to know what it feels like.
+
 ## Shutdown
 
 `SIGINT` or `SIGTERM` starts an orderly stop, and the order matters:
@@ -1279,14 +1522,26 @@ Everything else is optional and has a working default:
 | `RATE_LIMIT_AUTH_BURST` | `20` | how many may arrive at once |
 | `RATE_LIMIT_API_RPS` | `20` | authenticated requests per second, per user |
 | `RATE_LIMIT_API_BURST` | `40` | how many may arrive at once |
-| `REDIS_ADDR` | unset | `host:port` of Redis. Unset means presence is not tracked. Delivery does not use it |
-| `REDIS_PASSWORD` | unset | only if your Redis needs one |
+| `PRESENCE_ADDR` | unset | `host:port` of `presenced`. Unset means "online" shrinks to "has a socket on this node". Delivery does not use it |
 | `NATS_URL` | unset | `nats://host:port`. Unset means single-node: messages still reach this node's own sockets, and no others |
 | `OUTBOX_POLL_INTERVAL` | `100ms` | how long the relay waits when the queue is empty. This is the delivery latency the outbox costs |
 | `OUTBOX_RETENTION` | `1h` | how long a published outbox row is kept before it is deleted |
 | `INBOX_RETENTION` | `48h` | how long `consumed_messages` remembers a handled message. Must stay above the stream's own 24h retention, or a redelivery could be counted twice |
 | `NODE_ID` | hostname | the name this node uses in its logs, in presence, and in its fan-out consumer |
 | `TRUSTED_PROXIES` | unset | addresses or CIDRs whose `X-Forwarded-For` is believed. Unset means trust nobody |
+
+`presenced` reads its own, much shorter, set:
+
+| Variable | Default | What it does |
+| -------- | ------- | ------------ |
+| `REDIS_ADDR` | unset | `host:port` of Redis. **Required** — unlike an API node, a presence service with nowhere to keep presence refuses to start |
+| `REDIS_PASSWORD` | unset | only if your Redis needs one |
+| `PRESENCE_PORT` | `9090` | the gRPC port |
+| `PRESENCE_METRICS_PORT` | `9091` | a small HTTP listener for `/metrics` and `/livez` |
+| `LOG_LEVEL`, `APP_ENV`, `NODE_ID` | | the same meaning as above |
+
+`REDIS_ADDR` moved from the API node to `presenced` in Stage 6, and setting it
+on an API node now does nothing at all: that process has no Redis client left.
 
 `NATS_URL` is the switch between one node and many. Compose sets it; `make run`
 does not, so local development needs no broker at all — the relay still runs
@@ -1382,7 +1637,8 @@ migrates the database its old way.
 
 ### The cluster
 
-`docker compose up` starts Postgres, Redis, NATS, two API nodes and nginx:
+`docker compose up` starts Postgres, Redis, NATS, `presenced`, two API nodes and
+nginx:
 
 | Address | What |
 | ------- | ---- |
@@ -1390,18 +1646,30 @@ migrates the database its old way.
 | `localhost:8081` | `api1` directly |
 | `localhost:8082` | `api2` directly |
 | `localhost:5434` | Postgres |
-| `localhost:6380` | Redis |
+| `localhost:6380` | Redis — only `presenced` connects to it |
 | `localhost:4222` | NATS |
 | `localhost:8222` | the NATS monitoring page — try `/jsz?streams=1` |
+| `localhost:9095` | `presenced`, gRPC |
+| `localhost:9096` | `presenced`, `/metrics` |
 
 The two node ports are not how a client is meant to connect. They exist so a
 test can say "put this socket on that node", which is what `make splitcheck`,
-`make gapcheck` and `make outboxcheck` do. The database and Redis are published
-on unusual ports on purpose: a natively installed Postgres or Redis takes the
-normal one, and the failure that causes is nasty — on this machine, Docker held
-`5433` on IPv6 while a native Postgres held it on IPv4, so a host tool reached
-one or the other depending on which address family it picked, and reported a
-wrong password.
+`make gapcheck`, `make outboxcheck` and `make presencecheck` do. The database,
+Redis and `presenced` are published on unusual ports on purpose: something else
+usually holds the normal one — a natively installed Postgres or Redis, and
+Prometheus for `9090` — and the failure that causes is nasty. On this machine
+Docker held `5433` on IPv6 while a native Postgres held it on IPv4, so a host
+tool reached one or the other depending on which address family it picked, and
+reported a wrong password. Inside the compose network `presenced` is on `9090`
+and `9091`, which is what the API nodes use.
+
+The presence service speaks gRPC reflection, so it can be asked questions by
+hand without a copy of the `.proto`:
+
+```bash
+grpcurl -plaintext localhost:9095 list
+grpcurl -plaintext -d '{"user_ids":[1,2]}' localhost:9095 presence.v1.PresenceService/Online
+```
 
 Redis has no volume and NATS has one, and the difference is the point. Redis
 holds claims about right now that are stale within 30 seconds. NATS holds
@@ -1513,6 +1781,27 @@ and nothing else):
 make seed ARGS="-n 3"
 make outboxcheck
 make outboxcheck ARGS="-pause 25s"  # then kill and restart nats during the pause
+```
+
+Check that killing the presence service costs one endpoint and nothing else,
+and watch the circuit breaker turn a one-second failure into a five-millisecond
+one:
+```bash
+make presencecheck
+make presencecheck ARGS="-pause 50s"   # then kill and restart presenced during the pause
+```
+
+Run the presence service on its own (it needs a Redis; `make run` needs neither):
+```bash
+make presenced
+PRESENCE_ADDR=localhost:9090 make run   # in another terminal
+```
+
+Regenerate the gRPC code after editing a `.proto` (the generated files are
+committed, so this is only needed when the contract changes):
+```bash
+make proto
+make proto-breaking   # would this break a client that has not been rebuilt?
 ```
 
 Live reload the application:

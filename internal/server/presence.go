@@ -19,7 +19,7 @@ type presenceDTO struct {
 // PresenceHandler handles GET /conversations/:id/presence.
 //
 // "Online" here means "had a socket open somewhere in the cluster in the last
-// PresenceTTL". It is never exact, and it cannot be: the only honest way to
+// presence.TTL". It is never exact, and it cannot be: the only honest way to
 // know a client is gone is that it stopped saying it is here. A node that is
 // killed with -9 answers no goodbye, so a system that waits for one leaves
 // ghosts online forever.
@@ -40,10 +40,21 @@ func (s *Server) PresenceHandler(c *gin.Context) {
 
 	online, err := s.onlineMembers(c, memberIDs)
 	if err != nil {
-		// Redis being down is not a reason to fail the request with a 500 —
+		// The presence service being down is not a reason to fail with a 500 —
 		// but it IS a reason not to answer, because the honest answer would be
-		// "everyone is offline", and that is worse than no answer at all.
-		logFrom(c).Warn("presence lookup failed", "conversation_id", conversationID, "err", err)
+		// "everyone is offline", and that is worse than no answer at all. A
+		// client can show nothing; it cannot un-show a wrong thing.
+		//
+		// 503 and not 500 for the same reason the RPC used Unavailable: this
+		// says "ask again later", and the request that produced it was fine.
+		//
+		// Note which route this is. Presence being down costs THIS endpoint and
+		// nothing else — login, history, sending and the live socket never
+		// touch the presence service. That is what "degrade, do not crash"
+		// means in practice, and it is the reason presence was the right thing
+		// to split first.
+		logFrom(c).Warn("presence lookup failed",
+			"conversation_id", conversationID, "breaker", s.presence.BreakerState(), "err", err)
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "Presence is not available right now"})
 		return
 	}
@@ -61,12 +72,12 @@ func (s *Server) PresenceHandler(c *gin.Context) {
 
 // onlineMembers answers the same question in both modes.
 //
-// With Redis it is the whole cluster. Without it, this node's own sockets are
-// the whole world, and that answer is correct — for a single node it IS the
-// whole world.
+// With a presence service it is the whole cluster. Without one, this node's own
+// sockets are the whole world, and that answer is correct — for a single node
+// it IS the whole world.
 func (s *Server) onlineMembers(c *gin.Context, memberIDs []uint) (map[uint]bool, error) {
-	if s.cluster != nil {
-		return s.cluster.Online(c.Request.Context(), memberIDs)
+	if s.presence != nil {
+		return s.presence.Online(c.Request.Context(), memberIDs)
 	}
 
 	local := make(map[uint]bool, len(memberIDs))

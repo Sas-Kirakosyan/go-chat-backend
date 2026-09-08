@@ -15,10 +15,11 @@ import (
 	_ "github.com/joho/godotenv/autoload"
 
 	"go-chat-backend/internal/broker"
-	"go-chat-backend/internal/cluster"
 	"go-chat-backend/internal/database"
+	"go-chat-backend/internal/logging"
 	"go-chat-backend/internal/metrics"
 	"go-chat-backend/internal/outbox"
+	"go-chat-backend/internal/presence"
 	"go-chat-backend/internal/ws"
 )
 
@@ -35,14 +36,19 @@ type Server struct {
 	// them. It is delivery only: the write path is still REST.
 	hub *ws.Hub
 
-	// cluster is Redis, and it is nil when REDIS_ADDR is not set. Since Stage 5
-	// it does presence only.
+	// presence is a client for the presence service, and it is nil when
+	// PRESENCE_ADDR is not set.
+	//
+	// Until Stage 6 this field was a Redis connection and the node did the work
+	// itself. It is now a gRPC client to another process, and everything that
+	// changed about presence is in that sentence: the answer can be late, can
+	// fail because something unrelated is being deployed, and can be refused by
+	// this node's own circuit breaker without a packet being sent.
 	//
 	// nil is a supported mode, not a broken one: it means "one node", and then
-	// nobody is tracked as online. Delivery does not depend on it. That is what
-	// `make run` and every test uses, and it is why none of them need a Redis
-	// container.
-	cluster *cluster.Cluster
+	// online means "has a socket here". That is what `make run` and every test
+	// uses, and it is why none of them need Redis or a second process.
+	presence *presence.Client
 
 	// broker is NATS, and it is nil when NATS_URL is not set.
 	//
@@ -65,7 +71,7 @@ type Server struct {
 }
 
 // App owns everything the process has to shut down: the HTTP server, the
-// WebSocket hub, the database, Redis and the broker.
+// WebSocket hub, the database, the presence connection and the broker.
 //
 // main only starts it and stops it. The order things are closed in matters
 // more than the list itself, and it belongs next to the code that opened them,
@@ -73,12 +79,12 @@ type Server struct {
 type App struct {
 	HTTP *http.Server
 
-	srv     *Server
-	hub     *ws.Hub
-	db      database.Service
-	cluster *cluster.Cluster
-	broker  *broker.Broker
-	relay   *outbox.Relay
+	srv      *Server
+	hub      *ws.Hub
+	db       database.Service
+	presence *presence.Client
+	broker   *broker.Broker
+	relay    *outbox.Relay
 
 	// The relay, the two broker consumers and the presence heartbeat run for
 	// the life of the process. stopBackground ends them, and background waits
@@ -98,7 +104,11 @@ type App struct {
 func New() *App {
 	// First, before anything can want to log. Everything below writes
 	// structured lines, including the failures that stop the process.
-	log := setupLogging()
+	//
+	// It lives in internal/logging since Stage 6, because cmd/presenced needs
+	// the same setup and two services whose logs are formatted differently are
+	// two services you cannot read together.
+	log := logging.Setup()
 
 	port, err := strconv.Atoi(os.Getenv("PORT"))
 	if err != nil || port <= 0 {
@@ -126,15 +136,16 @@ func New() *App {
 	// runs, and Shutdown is what stops it again.
 	go hub.Run()
 
-	// Redis, if there is any. A missing REDIS_ADDR is single-node mode. A Redis
-	// that does not answer is a warning and not a stop: see cluster.FromEnv for
-	// what happened when this exited instead.
-	redis := cluster.FromEnv(ctx)
-	if redis == nil {
-		log.Info("no REDIS_ADDR, running as a single node: presence is not tracked")
+	// The presence service, if there is one. A missing PRESENCE_ADDR is
+	// single-node mode, and a presence service that is not up yet is neither an
+	// error nor a wait: the connection is made lazily on the first call. See
+	// presence.FromEnv.
+	presenceClient := presence.FromEnv()
+	if presenceClient == nil {
+		log.Info("no PRESENCE_ADDR, running as a single node: online means a socket on this node")
 	} else {
-		// The node name is on every line already, from setupLogging.
-		log.Info("presence enabled", "redis", os.Getenv("REDIS_ADDR"))
+		// The node name is on every line already, from logging.Setup.
+		log.Info("presence service configured", "addr", os.Getenv("PRESENCE_ADDR"))
 	}
 
 	// NATS, if there is any. A missing NATS_URL is single-node mode, and so is
@@ -151,8 +162,8 @@ func New() *App {
 	// instead of a counter and a metric drifting apart.
 	metrics.RegisterWebSocket(hub)
 	metrics.RegisterDBPool(db)
-	if redis != nil {
-		metrics.RegisterCluster(redis)
+	if presenceClient != nil {
+		metrics.RegisterPresence(presenceClient)
 	}
 	if nats != nil {
 		metrics.RegisterBroker(nats)
@@ -171,9 +182,9 @@ func New() *App {
 
 		jwtKey: []byte(jwtKey),
 
-		hub:     hub,
-		cluster: redis,
-		broker:  nats,
+		hub:      hub,
+		presence: presenceClient,
+		broker:   nats,
 
 		limits: limits,
 	}
@@ -212,7 +223,7 @@ func New() *App {
 		ErrorLog: slog.NewLogLogger(log.Handler(), slog.LevelWarn),
 	}
 
-	app := &App{HTTP: httpServer, srv: s, hub: hub, db: db, cluster: redis, broker: nats, relay: relay}
+	app := &App{HTTP: httpServer, srv: s, hub: hub, db: db, presence: presenceClient, broker: nats, relay: relay}
 	app.startBackground()
 	return app
 }
@@ -228,7 +239,7 @@ func New() *App {
 //     very node's relay published. One path in, so a message cannot arrive
 //     twice.
 //  3. The unread consumer, with a broker. Shared with the other nodes.
-//  4. The presence heartbeat, with Redis.
+//  4. The presence heartbeat, with a presence service.
 func (a *App) startBackground() {
 	ctx, cancel := context.WithCancel(context.Background())
 	a.stopBackground = cancel
@@ -258,7 +269,7 @@ func (a *App) startBackground() {
 		}()
 	}
 
-	if a.cluster == nil {
+	if a.presence == nil {
 		return
 	}
 
@@ -269,13 +280,20 @@ func (a *App) startBackground() {
 	}()
 }
 
-// runPresence tells Redis, on a timer, which users have a socket here.
+// runPresence tells the presence service, on a timer, which users have a socket
+// here.
 //
-// A failed beat is logged and the timer carries on. Redis being down must not
-// kill the loop: when it comes back, the next beat puts everyone online again
-// with no restart and no repair step.
+// A failed beat is dropped and the timer carries on. The service being down
+// must not kill the loop: when it comes back, the next beat puts everyone
+// online again with no restart and no repair step.
+//
+// It is also why the heartbeat is a good place for the breaker to learn. This
+// runs every ten seconds whether anyone is asking about presence or not, so by
+// the time a user opens a room page, the breaker already knows whether the
+// service is up — and answers instantly instead of making that user wait for
+// the timeout.
 func (a *App) runPresence(ctx context.Context) {
-	ticker := time.NewTicker(cluster.PresenceHeartbeat)
+	ticker := time.NewTicker(presence.Heartbeat)
 	defer ticker.Stop()
 
 	for {
@@ -284,12 +302,12 @@ func (a *App) runPresence(ctx context.Context) {
 			return
 
 		case <-ticker.C:
-			// A short deadline of its own. This runs every 10 seconds, so a beat
-			// that is still waiting when the next one is due is a beat worth
-			// abandoning.
-			beat, cancel := context.WithTimeout(ctx, cluster.PresenceHeartbeat/2)
-			_ = a.cluster.Heartbeat(beat, a.hub.UserIDs())
-			cancel()
+			// The client puts its own deadline on the call, so there is none
+			// here. That deadline travels to the other process over gRPC, which
+			// is the part a plain HTTP call would not have done: the service
+			// knows how long this node is prepared to wait and stops working on
+			// a beat nobody is listening for any more.
+			_ = a.presence.Heartbeat(ctx, a.hub.UserIDs())
 		}
 	}
 }
@@ -334,9 +352,10 @@ func (a *App) Shutdown(ctx context.Context) error {
 	// connection.
 	//
 	// Stopping the heartbeat here is also what takes this node's users offline:
-	// nobody refreshes them, so within one PresenceTTL they fall out of the
-	// window on their own. There is no goodbye message to send, which is the
-	// point — a crash cannot send one either.
+	// nobody refreshes them, so within one presence TTL they fall out of the
+	// window on their own. There is no goodbye RPC to send, which is the point —
+	// a crash could not send one either, and a design that needs one is a design
+	// that is wrong exactly when it matters.
 	//
 	// Nothing is lost if this node is killed before any of it happens. That is
 	// the whole reason the outbox exists: the instruction to deliver is a row
@@ -349,10 +368,10 @@ func (a *App) Shutdown(ctx context.Context) error {
 	a.hub.Close()
 
 	brokerErr := a.broker.Close()
-	redisErr := a.cluster.Close()
+	presenceErr := a.presence.Close()
 	dbErr := a.db.Close()
 
 	// errors.Join keeps every problem instead of hiding some, and returns nil
 	// when they are all nil.
-	return errors.Join(httpErr, brokerErr, redisErr, dbErr)
+	return errors.Join(httpErr, brokerErr, presenceErr, dbErr)
 }

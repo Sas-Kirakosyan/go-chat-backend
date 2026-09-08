@@ -1,7 +1,8 @@
 # Stage 3 turned this file into a small cluster: one database, two API nodes,
 # and nginx in front of them. Stage 5 added the broker they now talk through.
+# Stage 6 added the second service.
 #
-#   docker compose up --build            database + redis + nats + api1 + api2 + nginx
+#   docker compose up --build            database + redis + nats + presenced + api1 + api2 + nginx
 #   docker compose --profile observability up -d   ... and Prometheus
 #
 # Ports:
@@ -9,6 +10,13 @@
 #   8081  api1 directly
 #   8082  api2 directly
 #   8222  the NATS monitoring page
+#   9095  presenced, gRPC (try: grpcurl -plaintext localhost:9095 list)
+#   9096  presenced, /metrics
+#
+# Inside the network presenced is on 9090 and 9091. The published ports are
+# different because Prometheus already owns 9090 on this machine — the same
+# trap the database and Redis ports fell into. What the API nodes use is the
+# internal one; the published pair exists only so a person can poke at it.
 #
 # The two node ports are not how a client is meant to connect. They exist so a
 # test can say "put this socket on that node" and prove what each node does or
@@ -22,10 +30,18 @@ x-api: &api
   depends_on:
     psql_bp:
       condition: service_healthy
-    redis:
-      condition: service_healthy
     nats:
       condition: service_healthy
+    # service_started, not service_healthy. A node must be able to start while
+    # the presence service is down — that is the whole claim of Stage 6, and a
+    # depends_on that waits for health would quietly make it false. The gRPC
+    # connection is made lazily on the first call, so a node that starts first
+    # simply picks presence up when it appears.
+    #
+    # Note that redis is gone from this list. The API nodes no longer have a
+    # Redis client at all; presenced owns it now.
+    presenced:
+      condition: service_started
   environment: &api-env
     PORT: 8080
     APP_ENV: production
@@ -44,9 +60,14 @@ x-api: &api
     # it, any client could claim another IP and walk around the per-IP rate
     # limit by sending one header.
     TRUSTED_PROXIES: ${TRUSTED_PROXIES:-172.16.0.0/12}
-    # Presence. Unset it and a node still runs, still stores messages and
-    # still delivers them; it simply stops tracking who is online.
-    REDIS_ADDR: redis:6379
+    # The presence service. Unset it and a node still runs, still stores
+    # messages and still delivers them; "online" simply shrinks to mean "has a
+    # socket on this node".
+    #
+    # This replaced REDIS_ADDR in Stage 6. The address is a service, not a
+    # datastore, and that is the whole difference: a node can no longer read or
+    # write presence itself, it can only ask.
+    PRESENCE_ADDR: presenced:9090
     # The one setting that turns single-node mode into cluster mode. Unset it
     # and a node still accepts everything and still pushes to its own sockets —
     # it simply stops hearing about anyone else's.
@@ -94,11 +115,13 @@ services:
   redis:
     image: redis:8.2-alpine
     restart: unless-stopped
-    # No volume, and that is on purpose. Nothing here is worth keeping: Pub/Sub
-    # stores nothing at all, and presence is a claim about right now that is
-    # stale within 30 seconds. Every fact that must survive a restart is in
-    # Postgres. Giving Redis a disk would only invite someone to put something
-    # important in it.
+    # No volume, and that is on purpose. Presence is a claim about right now
+    # that is stale within 30 seconds; every fact that must survive a restart is
+    # in Postgres. Giving Redis a disk would only invite someone to put
+    # something important in it.
+    #
+    # Since Stage 6 only presenced connects to this. The published port below is
+    # for a person with redis-cli, not for the API nodes.
     #
     # Published on 6380, not 6379, in case a Redis is already running natively
     # on this machine — the same trap the database port fell into.
@@ -137,6 +160,39 @@ services:
       timeout: 3s
       retries: 10
       start_period: 2s
+
+  # Stage 6: the second service.
+  #
+  # It is built from the same image as the API nodes and runs a different
+  # binary. It holds the only Redis connection in the system now.
+  #
+  # Kill it and watch what happens:
+  #
+  #   docker compose kill presenced
+  #   curl -s localhost:8081/health | jq .presence
+  #
+  # The API nodes stay up, keep serving, keep delivering messages, and
+  # GET /conversations/:id/presence starts answering 503. After five failed
+  # calls each node's circuit breaker opens and those 503s become instant.
+  presenced:
+    build: .
+    restart: unless-stopped
+    command: ["presenced"]
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      APP_ENV: production
+      NODE_ID: presenced
+      PRESENCE_PORT: 9090
+      PRESENCE_METRICS_PORT: 9091
+      # The one thing this process needs. Unlike an API node, it refuses to
+      # start without it: a presence service with nowhere to keep presence is a
+      # configuration mistake, not a degraded mode.
+      REDIS_ADDR: redis:6379
+    ports:
+      - "9095:9090"
+      - "9096:9091"
 
   # Two nodes, not `deploy: replicas: 2`. Replicas share one name and one set
   # of published ports, and this stage needs to reach each node on purpose.
@@ -184,6 +240,7 @@ services:
     depends_on:
       - api1
       - api2
+      - presenced
     volumes:
       - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
     ports:

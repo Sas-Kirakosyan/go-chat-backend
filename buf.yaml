@@ -1,0 +1,23 @@
+# buf is the protobuf toolchain here, and it is used instead of protoc for one
+# practical reason: it is a Go program. `go run github.com/bufbuild/buf/...`
+# works on a machine with a Go toolchain and nothing else, while protoc is a
+# C++ binary that has to be installed and kept in step by hand.
+#
+# See `make proto`. The generated .go files are committed, so building and
+# testing this repo needs none of this.
+version: v2
+
+modules:
+  - path: proto
+
+lint:
+  use:
+    - STANDARD
+
+breaking:
+  # FILE is the strict setting: it fails on anything that would break a client
+  # compiled against the old file, including a field number reused for a
+  # different type. That is the check that matters now that the client and the
+  # server are deployed separately and can be different versions at once.
+  use:
+    - FILE

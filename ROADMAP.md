@@ -23,6 +23,9 @@ killing Redis stopped delivery but not sends" is a different sentence from
 
 Each stage ends with something running. No stage is only reading.
 
+For what the stages below have built so far, as one picture, see
+[`docs/architecture.md`](docs/architecture.md).
+
 ---
 
 ## Stage 0 — Graceful shutdown
@@ -254,11 +257,43 @@ what most job ads mean by "distributed systems".
 
 ## Stage 6 — Split a second service
 
-Extract one service for real — presence, or notifications — over **gRPC**.
+**Status:** done. The contract is
+[`proto/presence/v1/presence.proto`](proto/presence/v1/presence.proto), the
+service is [`cmd/presenced`](cmd/presenced), the client with its deadlines,
+retries and circuit breaker is
+[`internal/presence/client.go`](internal/presence/client.go), and the proof tool
+is [`cmd/presencecheck`](cmd/presencecheck). Measured numbers are in the README.
+
+Presence was the thing extracted, and the reason it was the right one is worth
+as much as the code: nothing joins to it, the product survives without it, and
+it is not on the write path. `internal/cluster` is gone — an API node has no
+Redis client at all now.
 
 - Define the contract in protobuf.
 - Add timeouts, deadlines, retries with backoff, and a circuit breaker.
 - Decide what happens when the other service is down. Degrade, do not crash.
+
+**What the build taught that the plan did not say:**
+
+- **"Did this fail?" and "did the service reply?" are different questions**, and
+  getting them confused made the circuit breaker do nothing at all. The code
+  treated any non-retryable error as an answer from the service, which is true
+  of every gRPC code except `DeadlineExceeded` — and a dead service returns
+  exactly that. Every failure was booked as a success, the breaker never opened,
+  and each request went on paying the full one-second timeout. Every unit test
+  passed, because they all ran against a server that answered.
+- **A breaker learns from traffic, so a quiet node stays ignorant.** During the
+  outage `api1` was being polled and opened its breaker in five seconds; `api2`
+  was answering nothing, so its only presence traffic was one heartbeat every
+  ten seconds, and it never got there. The first user to ask it a question pays
+  the full timeout.
+- **Recovery is slower than the outage.** After the service came back, a user
+  stayed offline for another ten seconds: the breaker had to reach its probe,
+  the probe had to succeed, and then a heartbeat had to run. Three waits that
+  are each correct, and they add.
+- **The compose file almost undid the stage.** `depends_on: service_healthy` on
+  the presence service reads like care and would have made the central claim
+  false — an API node must be able to start while presence is down.
 
 **Learn:** service boundaries, contracts, partial failure. You will also feel
 why splitting too early hurts. That lesson is worth as much as the code.
@@ -272,6 +307,11 @@ why splitting too early hurts. That lesson is worth as much as the code.
 OpenTelemetry, so one trace id follows a single message the whole way:
 
 HTTP request → outbox → broker → consumer → WebSocket push.
+
+Stage 6 made this the obvious next thing rather than a nice-to-have. There are
+now two services and a slow presence call has to be found by reading two logs
+side by side; gRPC already carries metadata across the boundary, so the trace id
+has somewhere to ride.
 
 Jaeger for traces, Grafana for the Prometheus metrics from Stage 2.
 
@@ -326,7 +366,7 @@ worked on one.
 - [x] Stage 3 — Two nodes, Redis Pub/Sub, presence
 - [x] Stage 4 — Delivery guarantees
 - [x] Stage 5 — Outbox and a broker
-- [ ] Stage 6 — A second service over gRPC
+- [x] Stage 6 — A second service over gRPC
 - [ ] Stage 7 — Tracing
 - [ ] Stage 8 — Data scale, load and chaos tests
 - [ ] Stage 9 — Kubernetes and CI

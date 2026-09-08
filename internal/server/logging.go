@@ -7,7 +7,6 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
-	"os"
 	"runtime/debug"
 	"strings"
 	"syscall"
@@ -33,51 +32,10 @@ const (
 // why an id from the network cannot be trusted as it arrives.
 const maxRequestIDLen = 64
 
-// setupLogging installs the process-wide structured logger and returns it.
-//
-// Structured means every line is key/value pairs, not a sentence. "a request
-// was slow" is a thing a human reads one of; status=500 route=/login is a
-// thing a machine can count, filter and alert on. Once there is more than one
-// node, reading logs by eye stops working, and this is what replaces it.
-//
-// JSON in production, plain text locally: a log shipper wants JSON, and a
-// person watching a terminal does not.
-//
-// slog.SetDefault also redirects the old log package, so any log.Printf left
-// anywhere in the tree — or inside a dependency — comes out in the same
-// format instead of bypassing all of this.
-func setupLogging() *slog.Logger {
-	opts := &slog.HandlerOptions{Level: logLevel()}
-
-	var handler slog.Handler = slog.NewJSONHandler(os.Stdout, opts)
-	if os.Getenv("APP_ENV") == "local" {
-		handler = slog.NewTextHandler(os.Stdout, opts)
-	}
-
-	logger := slog.New(handler)
-
-	// NODE_ID says which process wrote the line. With one node it is noise;
-	// with two behind nginx it is the first thing you need, because "the socket
-	// never got the message" and "this node never had the socket" look the same
-	// in a log that cannot tell the nodes apart.
-	if node := os.Getenv("NODE_ID"); node != "" {
-		logger = logger.With("node", node)
-	}
-
-	slog.SetDefault(logger)
-	return logger
-}
-
-func logLevel() slog.Level {
-	var level slog.Level
-	// UnmarshalText understands "debug", "info", "warn", "error", and any of
-	// them with an offset like "warn+2". An unset or unreadable value leaves
-	// the zero value, which is Info.
-	if err := level.UnmarshalText([]byte(os.Getenv("LOG_LEVEL"))); err != nil {
-		return slog.LevelInfo
-	}
-	return level
-}
+// The logger setup itself moved to internal/logging in Stage 6, because
+// cmd/presenced needs the same one. What stays here is the middleware: the
+// request id, the access log, and the panic recovery — all of them things only
+// an HTTP server has.
 
 // requestID gives every request an id and a logger that carries it.
 //

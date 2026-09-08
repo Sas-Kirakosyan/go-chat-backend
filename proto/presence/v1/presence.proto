@@ -1,0 +1,72 @@
+syntax = "proto3";
+
+// The contract between the API nodes and the presence service.
+//
+// This file is the boundary. Until Stage 6 the API node read the Redis sorted
+// set itself, so "the presence API" was a Go method and the compiler checked
+// every caller. Now the caller and the callee are two processes that are
+// deployed separately, and this file is the only thing they agree on.
+//
+// The version is in the package name — presence.v1 — because that is what a
+// breaking change costs once there are two processes. A field cannot simply be
+// renamed any more: during a rolling deploy the old API nodes and the new
+// service run at the same time, so both sides have to understand both shapes.
+// A v2 package is how that is done when a change cannot be made compatible.
+package presence.v1;
+
+option go_package = "go-chat-backend/internal/presencepb;presencepb";
+
+// PresenceService answers "who has a socket open right now?".
+//
+// Two calls, and they are opposites: nodes write with Heartbeat and read with
+// Online. Both are unary. Streaming was considered for Heartbeat and rejected:
+// a stream is a thing that can be half-open, and the one failure this service
+// must survive is a node that dies without saying goodbye. A call that either
+// happened or did not is easier to reason about than a stream that looks alive
+// because nobody has written to it.
+service PresenceService {
+  // Heartbeat records that these users are online on this node, right now.
+  //
+  // It is a full replacement of what that node claims, not a delta, so a node
+  // that missed a beat repairs itself with the next one. No goodbye call
+  // exists on purpose — see HeartbeatRequest.
+  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+
+  // Online reports which of the given users are online anywhere.
+  rpc Online(OnlineRequest) returns (OnlineResponse);
+}
+
+message HeartbeatRequest {
+  // Which node is speaking. It is part of the identity of an entry, so one
+  // user on a phone and a laptop, on two different nodes, is two entries and
+  // either one keeps them online.
+  //
+  // Without it, the node that lost the user would erase the node that still
+  // has them.
+  string node_id = 1;
+
+  // Every user with a socket on this node. The whole list every time.
+  //
+  // There is no "user went offline" call, and that is the design, not a gap.
+  // The one moment a node cannot send such a call is the moment it is killed,
+  // which is exactly the case presence has to survive. Entries expire on
+  // their own instead, so a node that stops beating takes its users with it.
+  repeated uint64 user_ids = 2;
+}
+
+// Empty. The reply carries no information beyond "this was written", and an
+// empty message is still the right shape: a field can be added later without
+// changing the method.
+message HeartbeatResponse {}
+
+message OnlineRequest {
+  // The users being asked about — usually the members of one room.
+  repeated uint64 user_ids = 1;
+}
+
+message OnlineResponse {
+  // Only the online ones. The caller already knows the full list it asked
+  // about, so sending a flag per user would put the same ids on the wire
+  // twice.
+  repeated uint64 online_user_ids = 1;
+}

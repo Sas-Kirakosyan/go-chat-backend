@@ -212,22 +212,94 @@ func RegisterWebSocket(s WSStats) {
 	}, func() float64 { return float64(s.Expired()) }))
 }
 
-// ClusterStats is what the metrics package needs from the Redis layer.
+// PresenceStats is what the metrics package needs from the presence client.
 //
-// It used to carry the fan-out counters too. Those moved to BrokerStats in
-// Stage 5, along with the fan-out itself; Redis keeps only presence.
-type ClusterStats interface {
-	PresenceFailed() int
+// It used to be ClusterStats, over a Redis connection this node owned, and one
+// counter was enough: a command either worked or it did not. A call to another
+// process has more ways to go, and each one needs a different response from a
+// person, so each one is its own number.
+type PresenceStats interface {
+	Calls() int64
+	Failures() int64
+	Retries() int64
+	ShortCircuited() int64
+	BreakerState() string
 }
 
-// RegisterCluster publishes what is left of the Redis counters.
-func RegisterCluster(s ClusterStats) {
+// RegisterPresence publishes the presence client's numbers.
+//
+// # What each one is for
+//
+// failures_total against calls_total is the error rate of the dependency.
+//
+// retries_total is the early warning. It rises while calls still succeed — a
+// connection dropped by a deploy, one instance restarting — so a step up here
+// with a flat failure rate means presence is getting less healthy before anyone
+// has noticed.
+//
+// short_circuited_total is the breaker doing its job, and it is the one that
+// explains a graph that otherwise makes no sense: presence errors on the API
+// node while the presence service's own metrics show almost no traffic. Those
+// requests never left this process.
+//
+// breaker_open is the state as a number, and it is the one to alert on. An open
+// breaker means this node has given up on presence entirely; unlike a slow
+// dependency, it will not fix itself in the graphs, because no calls are being
+// made to fail.
+func RegisterPresence(s PresenceStats) {
+	counter := func(name, help string, read func() float64) {
+		register(prometheus.NewCounterFunc(prometheus.CounterOpts{
+			Namespace: namespace,
+			Subsystem: "presence",
+			Name:      name,
+			Help:      help,
+		}, read))
+	}
+
+	counter("calls_total", "Presence RPCs this node started. A call the breaker refused is not counted here.",
+		func() float64 { return float64(s.Calls()) })
+	counter("failures_total", "Presence RPCs that failed after every retry.",
+		func() float64 { return float64(s.Failures()) })
+	counter("retries_total", "Retried attempts. Rising while failures stay flat is the early warning.",
+		func() float64 { return float64(s.Retries()) })
+	counter("short_circuited_total", "Calls the circuit breaker refused without touching the network.",
+		func() float64 { return float64(s.ShortCircuited()) })
+
+	register(prometheus.NewGaugeFunc(prometheus.GaugeOpts{
+		Namespace: namespace,
+		Subsystem: "presence",
+		Name:      "breaker_open",
+		Help:      "1 when this node has cut presence off, 0.5 while it is probing, 0 when it is healthy.",
+	}, func() float64 {
+		switch s.BreakerState() {
+		case "open":
+			return 1
+		case "half-open":
+			return 0.5
+		default:
+			return 0
+		}
+	}))
+}
+
+// PresenceStoreStats is what the metrics package needs inside cmd/presenced.
+//
+// It is the other side of PresenceStats above, and having both is the point:
+// the client's numbers say what the API nodes experienced, and this says what
+// the service itself saw. When they disagree — errors on the caller, none on
+// the callee — the failure is in the network or in the breaker, not in Redis.
+type PresenceStoreStats interface {
+	Failures() int64
+}
+
+// RegisterPresenceStore publishes the presence service's own counters.
+func RegisterPresenceStore(s PresenceStoreStats) {
 	register(prometheus.NewCounterFunc(prometheus.CounterOpts{
 		Namespace: namespace,
-		Subsystem: "cluster",
-		Name:      "presence_failures_total",
-		Help:      "Presence heartbeats that failed. Enough in a row and this node's users look offline.",
-	}, func() float64 { return float64(s.PresenceFailed()) }))
+		Subsystem: "presence",
+		Name:      "store_failures_total",
+		Help:      "Redis commands the presence service could not complete.",
+	}, func() float64 { return float64(s.Failures()) }))
 }
 
 // OutboxStats is what the metrics package needs from the relay.

@@ -23,3 +23,19 @@ scrape_configs:
       # "500 sockets are open" is not a useful number if it is really 500 on one
       # node and 0 on the other.
       - targets: ["api1:8080", "api2:8080"]
+
+  # Stage 6. The presence service is its own process, so it is its own job.
+  #
+  # Its port here is not the gRPC port: a gRPC server cannot serve a Prometheus
+  # text page, so presenced runs a small HTTP listener beside it for /metrics
+  # and /livez. That is the usual shape — the data plane speaks gRPC and the
+  # operational surface speaks HTTP, because everything that watches a service
+  # already knows how to scrape one.
+  #
+  # Worth comparing side by side:
+  #   chat_presence_calls_total          what the API nodes tried
+  #   chat_presence_store_failures_total what the service actually failed at
+  #   chat_presence_breaker_open         whether the API nodes gave up asking
+  - job_name: presence
+    static_configs:
+      - targets: ["presenced:9091"]

@@ -44,6 +44,7 @@ import (
 	"syscall"
 	"time"
 
+	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/health"
 	"google.golang.org/grpc/health/grpc_health_v1"
@@ -54,6 +55,7 @@ import (
 	"go-chat-backend/internal/metrics"
 	"go-chat-backend/internal/presence"
 	"go-chat-backend/internal/presencepb"
+	"go-chat-backend/internal/tracing"
 )
 
 const (
@@ -99,6 +101,24 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	// Tracing, if there is a collector. "presence" is the name this process
+	// wears in Jaeger, and having a second name is the point: a waterfall that
+	// says which spans ran in which service is what makes a split visible.
+	//
+	// With no OTEL_EXPORTER_OTLP_ENDPOINT this installs a no-op and returns, so
+	// running presenced by hand needs nothing new.
+	traceShutdown := tracing.Setup(ctx, "presence")
+	defer func() {
+		// Its own context and its own short deadline. ctx is already cancelled
+		// by the time this runs — that is what started the shutdown — and a
+		// collector that is down must not delay the exit.
+		flushCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		if err := traceShutdown(flushCtx); err != nil {
+			log.Warn("could not flush traces on shutdown", "err", err)
+		}
+	}()
+
 	// The store. Unlike the API node, this process cannot do its job without
 	// Redis, so a missing REDIS_ADDR stops it — that is a configuration
 	// mistake, not a degraded mode. A Redis that is merely down does NOT stop
@@ -139,6 +159,14 @@ func main() {
 			MinTime:             10 * time.Second,
 			PermitWithoutStream: true,
 		}),
+		// The other end of the trace. The API node put a traceparent in the
+		// call's metadata; this reads it, so a span created inside this process
+		// is a child of the HTTP request on the node that asked — a request in
+		// a different container, made by a different binary.
+		//
+		// That is the whole promise of the stage in one option: two services,
+		// one waterfall.
+		grpc.StatsHandler(otelgrpc.NewServerHandler()),
 	)
 
 	presencepb.RegisterPresenceServiceServer(server, presence.NewService(store))

@@ -57,8 +57,25 @@ func (s *Server) requestID() gin.HandlerFunc {
 		}
 
 		c.Set(requestIDKey, id)
-		c.Set(loggerKey, slog.Default().With("request_id", id))
 		c.Writer.Header().Set(requestIDHeader, id)
+
+		// Stage 7: the trace id goes on the same logger, beside the request id
+		// rather than instead of it.
+		//
+		// They answer different questions and both are worth keeping. The
+		// request id is ours, it is short, it is in the response header, and it
+		// works with tracing switched off — the browser client and every check
+		// tool already read it. The trace id is the one that also appears on the
+		// relay's lines, on the other node's fan-out, and in Jaeger.
+		//
+		// This middleware runs AFTER traceRequests, which is why there is a span
+		// on the request context to read here at all. Swap the two and this
+		// silently writes nothing.
+		log := slog.Default().With("request_id", id)
+		if attrs := traceAttrs(c); attrs != nil {
+			log = log.With(attrs...)
+		}
+		c.Set(loggerKey, log)
 
 		c.Next()
 	}

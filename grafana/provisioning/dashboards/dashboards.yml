@@ -1,0 +1,17 @@
+# Where Grafana looks for dashboard JSON.
+#
+# The files themselves are in ./grafana/dashboards, mounted read-only. Read-only
+# matters: it means a dashboard cannot be edited into the container and then
+# quietly lost. Change the JSON in the repo, restart Grafana, and what everybody
+# sees is what is committed.
+
+apiVersion: 1
+
+providers:
+  - name: go-chat-backend
+    type: file
+    # Grafana would otherwise put these in a "General" bucket with everything
+    # else that has no home.
+    folder: go-chat-backend
+    options:
+      path: /var/lib/grafana/dashboards

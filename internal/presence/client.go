@@ -9,6 +9,13 @@ import (
 	"sync/atomic"
 	"time"
 
+	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
+	"go.opentelemetry.io/otel/attribute"
+	// Aliased because this file already imports grpc/codes, and the two mean
+	// different things: one is what the service answered, the other is whether
+	// the span is marked as failed.
+	otelcodes "go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
@@ -17,6 +24,7 @@ import (
 
 	"go-chat-backend/internal/logging"
 	"go-chat-backend/internal/presencepb"
+	"go-chat-backend/internal/tracing"
 )
 
 // The client half of the split, and the half where all the interesting
@@ -129,6 +137,18 @@ func FromEnv() *Client {
 		// Cap what one answer may be. The default is 4MB, which for a message
 		// containing a list of user ids is not a limit at all.
 		grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(1<<20)),
+
+		// Stage 7: the trace crosses to the other process here, and this is the
+		// cheapest boundary of the four. gRPC already sends metadata with every
+		// call, so the traceparent rides along with no code of ours — no column
+		// like the outbox needed, no header adapter like NATS needed.
+		//
+		// A stats handler, not an interceptor. Interceptors see the call; the
+		// stats handler also sees the stream underneath it, which is what makes
+		// the span end at the right moment on a call that fails at the
+		// transport rather than in the handler — a dead service, which is the
+		// case Stage 6 kept getting wrong.
+		grpc.WithStatsHandler(otelgrpc.NewClientHandler()),
 	)
 	if err != nil {
 		// Only a bad target string can get here — everything else is deferred
@@ -164,7 +184,7 @@ func (c *Client) Online(ctx context.Context, userIDs []uint) (map[uint]bool, err
 	}
 
 	var got []uint64
-	err := c.call(ctx, onlineTimeout, func(ctx context.Context) error {
+	err := c.call(ctx, "presence.Online", onlineTimeout, func(ctx context.Context) error {
 		resp, err := c.rpc.Online(ctx, &presencepb.OnlineRequest{UserIds: ids})
 		if err != nil {
 			return err
@@ -196,7 +216,7 @@ func (c *Client) Heartbeat(ctx context.Context, userIDs []uint) error {
 		ids[i] = uint64(id)
 	}
 
-	return c.call(ctx, heartbeatTimeout, func(ctx context.Context) error {
+	return c.call(ctx, "presence.Heartbeat", heartbeatTimeout, func(ctx context.Context) error {
 		_, err := c.rpc.Heartbeat(ctx, &presencepb.HeartbeatRequest{
 			NodeId:  c.nodeID,
 			UserIds: ids,
@@ -254,9 +274,35 @@ func (c *Client) Close() error {
 //     caller said how long it is prepared to wait; retries spend that budget,
 //     they do not extend it.
 //  3. Then the attempts, with backoff between them.
-func (c *Client) call(parent context.Context, timeout time.Duration, fn func(context.Context) error) error {
+func (c *Client) call(parent context.Context, op string, timeout time.Duration, fn func(context.Context) error) error {
+	// The span covers the WHOLE logical call — breaker, deadline and every
+	// attempt — not one gRPC round trip. otelgrpc already traces each attempt
+	// underneath; this is the span that says what this client did around them.
+	//
+	// It is also the answer to the worst bug of Stage 6. The code there treated
+	// "did this fail" and "did the service reply" as the same question, so a
+	// dead service (which returns DeadlineExceeded) was booked as a success,
+	// the breaker never opened, and every request kept paying the full second.
+	// Every unit test passed, because they all ran against a server that
+	// answered. On a trace the two are not confusable: a call that pays 1s and
+	// then fails and a call refused in 5 microseconds with a short_circuited
+	// event are different shapes, visible in one screenshot.
+	//
+	// The span is named after the OPERATION, and that is not cosmetics — it is
+	// what makes the sampler work. The first version called every span
+	// "presence.call", and the heartbeat's span is a root, because a timer has
+	// nobody above it. So two nodes started a new trace every ten seconds
+	// forever, and the sampler could not drop them: it was matching the gRPC
+	// method name, which belongs to a span created further down, INSIDE the
+	// trace this one had already begun. Dropping a child does not undo a root.
+	// The name of the outermost span is the only one a root sampler ever sees.
+	parent, span := tracing.Tracer().Start(parent, op)
+	defer span.End()
+
 	if !c.breaker.allow() {
 		c.shortCircuited.Add(1)
+		span.AddEvent("short_circuited")
+		span.SetStatus(otelcodes.Error, ErrCircuitOpen.Error())
 		return ErrCircuitOpen
 	}
 
@@ -281,7 +327,7 @@ func (c *Client) call(parent context.Context, timeout time.Duration, fn func(con
 			// node's own request would otherwise cut off a service that is
 			// working perfectly.
 			c.breaker.success()
-			return err
+			return markFailed(span, err)
 		}
 
 		// Nobody answered. Retry if there is any point, and give up otherwise —
@@ -313,14 +359,40 @@ func (c *Client) call(parent context.Context, timeout time.Duration, fn func(con
 		case <-ctx.Done():
 			timer.Stop()
 			c.record(parent, err)
-			return err
+			return markFailed(span, err)
 		case <-timer.C:
 		}
 
 		c.retries.Add(1)
+		span.AddEvent("retry", trace.WithAttributes(
+			attribute.Int("attempt", attempt+1),
+			attribute.Int64("waited_ms", wait.Milliseconds()),
+		))
 	}
 
 	c.record(parent, err)
+	return markFailed(span, err)
+}
+
+// markFailed puts a failed call on its span and hands the error back unchanged.
+//
+// Every failing exit from call goes through it, which is the point: the first
+// version set the attributes only at the bottom of the function, and the branch
+// that matters most — "the service answered and said no" — returns early and
+// never reached them. A test caught it, which is a small version of the same
+// lesson Stage 6 taught: the interesting case is usually the one that returns
+// early.
+func markFailed(span trace.Span, err error) error {
+	if err == nil {
+		return nil
+	}
+	span.RecordError(err)
+	span.SetStatus(otelcodes.Error, err.Error())
+	// Whether the breaker learned anything from this call. It is the exact
+	// distinction the Stage 6 bug got wrong — "did it fail" against "did the
+	// service reply" — so it is worth being able to read it off a single failed
+	// call rather than inferring it from a counter five minutes later.
+	span.SetAttributes(attribute.Bool("presence.answered", answered(err)))
 	return err
 }
 

@@ -3,13 +3,17 @@
 # Stage 6 added the second service.
 #
 #   docker compose up --build            database + redis + nats + presenced + api1 + api2 + nginx
-#   docker compose --profile observability up -d   ... and Prometheus
+#   docker compose --profile observability up -d   ... and Prometheus, Jaeger, Grafana
+#   docker compose --profile load run --rm k6 read.js    the Stage 8 load test
 #
 # Ports:
 #   8080  nginx, the address a client should use
 #   8081  api1 directly
 #   8082  api2 directly
 #   8222  the NATS monitoring page
+#   16686 Jaeger, the traces (observability profile)
+#   3000  Grafana (observability profile)
+#   9090  Prometheus (observability profile)
 #   9095  presenced, gRPC (try: grpcurl -plaintext localhost:9095 list)
 #   9096  presenced, /metrics
 #
@@ -76,6 +80,16 @@ x-api: &api
     # instruction to deliver it are one transaction in Postgres, so a node with
     # no broker at all still takes writes and hands them over when it returns.
     NATS_URL: nats://nats:4222
+    # Stage 7. Where spans go. Unset it and the nodes run exactly as before with
+    # no tracing at all — see internal/tracing.
+    #
+    # It points at Jaeger, which is only started by the observability profile.
+    # That is deliberate and it is the honest test: a collector that is not
+    # running must cost nothing. `docker compose up` without the profile leaves
+    # this address dead, and sends still answer in the same ~10 ms, because the
+    # exporter batches in the background and drops what it cannot deliver.
+    OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4317
+    OTEL_SERVICE_NAME: chat-api
 
 services:
   psql_bp:
@@ -190,6 +204,11 @@ services:
       # start without it: a presence service with nowhere to keep presence is a
       # configuration mistake, not a degraded mode.
       REDIS_ADDR: redis:6379
+      # Stage 7. A different service name from the API nodes, which is the whole
+      # value of it: one waterfall that says which spans ran in which process is
+      # a picture of the split, and "chat-api" on every span would not be.
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4317
+      OTEL_SERVICE_NAME: presence
     ports:
       - "9095:9090"
       - "9096:9091"
@@ -232,8 +251,8 @@ services:
   #
   #   docker compose --profile observability up -d
   #
-  # Stage 7 adds Grafana on top of this, which is why the scrape config lives
-  # in the repo rather than being typed into a UI.
+  # Stage 7 added Grafana and Jaeger below, and the scrape config living in the
+  # repo is what let that be a file change rather than a UI session.
   prometheus:
     image: prom/prometheus:v3.1.0
     profiles: ["observability"]
@@ -245,6 +264,102 @@ services:
       - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
     ports:
       - "9090:9090"
+
+  # Stage 7: where the traces go.
+  #
+  #   docker compose --profile observability up -d
+  #   http://localhost:16686
+  #
+  # all-in-one is the collector, the store and the UI in one container, with an
+  # in-memory backend. That is right here and wrong in production: restart it
+  # and every trace is gone. Traces are evidence about the last few minutes, not
+  # a record — Postgres is the record — so losing them costs nothing that
+  # matters on a laptop.
+  #
+  # There is no separate OpenTelemetry Collector. Jaeger accepts OTLP directly,
+  # so the apps export straight to it. A real deployment puts a Collector in
+  # between to batch, sample and fan out to more than one backend; at this size
+  # it would be one more process to run for no lesson.
+  jaeger:
+    image: jaegertracing/all-in-one:1.65.0
+    profiles: ["observability"]
+    environment:
+      # Jaeger 1.65 still needs this switched on explicitly.
+      COLLECTOR_OTLP_ENABLED: "true"
+    ports:
+      # The UI. This is the port you actually open.
+      - "16686:16686"
+      # OTLP over gRPC — what OTEL_EXPORTER_OTLP_ENDPOINT above points at.
+      # Published so that `make run` on the host can export to it too, without
+      # the API having to be in a container.
+      - "4317:4317"
+      # OTLP over HTTP, for anything that cannot speak gRPC. Nothing here uses
+      # it; it is published because a browser one day might.
+      - "4318:4318"
+
+  # Grafana, over the Prometheus that has been here since Stage 2.
+  #
+  #   http://localhost:3000 — anonymous admin, no login page.
+  #
+  # Both datasources are provisioned from files in the repo, for the same reason
+  # prometheus.yml is: a dashboard typed into a UI lives in one Docker volume
+  # and is gone the first time somebody runs `docker compose down -v`.
+  #
+  # The interesting part of the wiring is in datasources.yml: the Prometheus
+  # datasource is linked to the Jaeger one, so a spike on a latency graph can be
+  # opened as the trace that caused it. Metrics say something is slow; traces
+  # say which step.
+  grafana:
+    image: grafana/grafana:11.5.1
+    profiles: ["observability"]
+    depends_on:
+      - prometheus
+      - jaeger
+    environment:
+      # No login page. This is one machine being watched by hand, and a
+      # password prompt on every restart is friction with nothing behind it.
+      # It is also exactly what must not ship anywhere real.
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports:
+      - "3000:3000"
+
+  # Stage 8: the load test.
+  #
+  #   make seed ARGS="-n 50 -rooms 20 -messages 200"
+  #   make k6
+  #
+  # It is a container so that nothing has to be installed on the machine, and
+  # because being inside the network is what lets it reach nginx by name at
+  # port 80 — the address a real client uses, not a published port.
+  #
+  # It runs to completion and stops, so it has its own profile: `docker compose
+  # up` must not start a load test.
+  #
+  # `make k6` reaches it with `docker compose run`, not `up`, because k6 exits
+  # non-zero when a threshold fails and that exit code is the run's verdict.
+  # `up` would swallow it.
+  k6:
+    image: grafana/k6:0.55.0
+    profiles: ["load"]
+    depends_on:
+      - nginx
+    environment:
+      BASE_URL: http://nginx:80
+    volumes:
+      - ./k6:/scripts:ro
+    # The script is named relatively, from working_dir, and it has to be. Git
+    # Bash on Windows rewrites any argument that looks like an absolute Unix
+    # path into a Windows one before docker.exe ever sees it, so
+    # `/scripts/read.js` arrives as `C:/Program Files/Git/scripts/read.js` and
+    # k6 cannot find it. A relative path is left alone by every shell.
+    working_dir: /scripts
+    entrypoint: ["k6", "run"]
+    command: ["read.js"]
 
 volumes:
   psql_volume_bp:

@@ -1,0 +1,103 @@
+{
+  "title": "Delivery",
+  "uid": "chat-delivery",
+  "tags": ["go-chat-backend"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "refresh": "5s",
+  "time": { "from": "now-15m", "to": "now" },
+  "templating": { "list": [] },
+  "panels": [
+    {
+      "type": "text",
+      "title": "What to look at",
+      "gridPos": { "h": 4, "w": 24, "x": 0, "y": 0 },
+      "options": {
+        "mode": "markdown",
+        "content": "Every panel is **per node** — that is the point since Stage 3. `chat_ws_connections_open` summed across the cluster hides the case that matters: 500 sockets on one node and 0 on the other.\n\nWhen a number here looks wrong, open the same moment in [Jaeger](http://localhost:16686). Metrics say *something is slow*; a trace says *which step*."
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Requests per second, by node",
+      "description": "Both nodes should carry roughly the same load. A node at zero is a node nginx has taken out — check /readyz.",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 4 },
+      "fieldConfig": { "defaults": { "unit": "reqps" }, "overrides": [] },
+      "targets": [
+        {
+          "expr": "sum by (instance) (rate(chat_http_requests_total[1m]))",
+          "legendFormat": "{{instance}}"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Request latency p99, by route",
+      "description": "The send path should sit near 10ms. Everything after the 201 happens on the relay's own time and is not in here — that part is only visible on a trace.",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 4 },
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.99, sum by (le, route) (rate(chat_http_request_duration_seconds_bucket[1m])))",
+          "legendFormat": "{{route}}"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Outbox pending",
+      "description": "Rows written and not yet published. Zero at rest. It climbs the moment NATS goes away and drains when it returns — nothing is lost, only late.",
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 12 },
+      "targets": [
+        { "expr": "max(chat_outbox_pending)", "legendFormat": "pending" }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Outbox lag",
+      "description": "How long the oldest waiting row has waited. This is the number the outbox.publish span shows for one message; here it is the whole queue.",
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 12 },
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
+      "targets": [
+        { "expr": "max(chat_outbox_lag_seconds)", "legendFormat": "oldest row" }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Relay leader",
+      "description": "Exactly one node must be 1. Two would publish seq 5 before seq 4 and throw away Stage 4; zero means nothing is draining the outbox.",
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 12 },
+      "fieldConfig": { "defaults": { "max": 1, "min": 0 }, "overrides": [] },
+      "targets": [
+        {
+          "expr": "chat_outbox_relay_leader",
+          "legendFormat": "{{instance}}"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Open sockets, by node",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 20 },
+      "targets": [
+        {
+          "expr": "chat_ws_connections_open",
+          "legendFormat": "{{instance}}"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Presence circuit breaker",
+      "description": "1 means a node has stopped calling presenced. Watch the two nodes differ: a node nobody is asking learns nothing, and its breaker stays closed through the whole outage.",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 20 },
+      "fieldConfig": { "defaults": { "max": 1, "min": 0 }, "overrides": [] },
+      "targets": [
+        {
+          "expr": "chat_presence_breaker_open",
+          "legendFormat": "{{instance}}"
+        }
+      ]
+    }
+  ]
+}

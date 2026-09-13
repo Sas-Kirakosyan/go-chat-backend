@@ -115,6 +115,61 @@ outboxcheck:
 presencecheck:
 	@go run ./cmd/presencecheck $(ARGS)
 
+# Stage 7: prove that ONE trace id follows one message across every process it
+# touches — the HTTP request, the outbox row in Postgres, the relay, NATS, and
+# the fan-out on the OTHER node.
+#
+# It invents a traceparent, sends with it, then asks Jaeger what is in that
+# trace and prints the spans as a waterfall. Two things to read: the PASS line
+# needs at least two processes in one trace, and the OFFSET column shows the
+# gap between the 201 and the publish — that gap is the relay's poll interval,
+# the number Stage 5 estimated and never measured.
+#
+# Jaeger is in the observability profile, so it is not started by a plain
+# `docker compose up`:
+#
+#   docker compose --profile observability up --build -d
+#   make seed ARGS="-n 3"
+#   make tracecheck
+#
+# The run that matters: kill the collector and confirm it costs nothing.
+#
+#   make tracecheck ARGS="-pause 20s"
+#   docker compose kill jaeger        # during the pause
+tracecheck:
+	@go run ./cmd/tracecheck $(ARGS)
+
+# Everything, with the graphs and the traces:
+#
+#   http://localhost:16686   Jaeger, the traces
+#   http://localhost:3000    Grafana, over the Prometheus from Stage 2
+#   http://localhost:9090    Prometheus itself
+observability:
+	@docker compose --profile observability up --build -d
+
+# Stage 8: the load test for the REST read path, in k6.
+#
+# This is the tool that turns every later change in Stage 8 into a number. Run
+# it once before touching anything — that run is the baseline — and again after
+# each change, and compare the p50, p95 and p99 of the read_* lines.
+#
+# It needs rooms that already have history, which a fresh database does not
+# have:
+#
+#   docker compose up --build -d
+#   make seed ARGS="-n 50 -rooms 20 -messages 200"
+#   make k6
+#
+# The run that finds the knee instead of measuring one point:
+#
+#   make k6 ARGS="-e PROFILE=ramp"
+#
+# k6 runs inside the compose network, so it reaches nginx by name on port 80 —
+# the address a real client uses. `run`, not `up`, because k6 exits non-zero
+# when a threshold fails and that exit code is the verdict.
+k6:
+	@docker compose --profile load run --rm k6 $(ARGS) read.js
+
 # Migrations. The server applies them itself on startup; these are for looking
 # before you leap, and for stepping back after a mistake.
 migrate-status:
@@ -257,6 +312,7 @@ watch:
 	}"
 
 .PHONY: all build run presenced web seed wsload splitcheck gapcheck outboxcheck presencecheck \
+	tracecheck observability k6 \
 	clean watch docker-run docker-down proto proto-breaking \
 	test test-v test-one test-race itest cover \
 	migrate-status migrate-up migrate-down migration

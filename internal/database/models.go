@@ -135,6 +135,21 @@ type Outbox struct {
 	// debugging.
 	Payload string
 
+	// TraceContext is the W3C trace carrier of the request that wrote this row,
+	// as JSON, or nil.
+	//
+	// It is separate from Payload on purpose. Payload is what the message IS,
+	// and it is decoded into the frame a client receives; a traceparent in
+	// there would leak transport metadata into the product. This column is how
+	// we watched the message being sent, which is a different thing that lives
+	// next to it.
+	//
+	// nil is the ordinary case and every reader must handle it: rows from
+	// before Stage 7, rows written with tracing off, rows that were not
+	// sampled. The relay publishes all of them the same way — it just starts a
+	// new trace instead of continuing one. See internal/tracing/carrier.go.
+	TraceContext *string `gorm:"type:jsonb"`
+
 	CreatedAt time.Time
 
 	// PublishedAt is nil while the row is still waiting. The relay asks for

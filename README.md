@@ -36,10 +36,16 @@ endpoint and nothing else, and after five failed calls a circuit breaker turns
 a one-second timeout into a five-millisecond refusal — see
 [A second service](#a-second-service).
 
-Still missing: the relay polls, so live delivery costs up to 100ms more than it
-did — Postgres `LISTEN/NOTIFY` would remove that. And a message crossing four
-processes still has no single id following it, so a slow step has to be found by
-reading four logs side by side. Tracing is the next stage.
+One **trace id** now follows one message the whole way: the HTTP request, the
+outbox row in Postgres, the relay, NATS, and the fan-out on the other node.
+Jaeger draws it as one waterfall, and it turned the relay poll from an estimate
+into a measurement — see [Tracing](#tracing).
+
+Still missing: the relay polls, so live delivery costs anywhere from a few ms to
+nearly 100ms more than it did — measured at 6ms, 40ms and 92ms on three runs.
+That is now a measured number rather than a guess, and Postgres `LISTEN/NOTIFY`
+would remove it. Scaling the data — a read replica, partitions, a load test with
+real percentiles — is the next stage.
 
 ## Endpoints
 
@@ -1431,6 +1437,125 @@ scaled, and broken without touching the chat, and the code proves it rather than
 promising it. On a service with three teams that is worth a great deal. On this
 one it is worth doing once, deliberately, to know what it feels like.
 
+## Tracing
+
+A log line says *something happened here*. A trace says *this one thing
+happened, and here is every step it took, in every process, and how long each
+one waited*.
+
+That distinction stopped being academic at Stage 6. A message crosses four
+processes, and until now following one meant opening four logs and matching
+timestamps by eye.
+
+```
+docker compose --profile observability up --build -d
+make seed ARGS="-n 3"
+make tracecheck
+```
+
+`make tracecheck` invents a `traceparent`, sends a message with it, waits for it
+to arrive on a socket **on the other node**, then asks Jaeger what is in that
+trace:
+
+```
+send answered in 8.8ms    (this is the user's wait; everything after it is not)
+delivered in     83.3ms   to a socket on the other node
+
+SPAN                                   SERVICE          OFFSET       TOOK
+--------------------------------------------------------------------------
+POST /conversations/:id/messages       api1                 0s      7.1ms
+outbox.publish                         api1             79.3ms      2.3ms
+unread.apply                           api1             81.6ms      4.5ms
+fanout.deliver                         api1             81.7ms       64µs
+fanout.deliver                         api2             81.7ms      112µs
+
+processes in this one trace: api1, api2
+```
+
+**Read the OFFSET column.** The request answered in 7.1 ms and then nothing
+happened for 72 ms. That gap is the relay waiting for its next poll tick, and it
+is the first time this project has seen it rather than estimated it. Stage 5
+guessed "up to 100 ms"; measured, it was **92 ms** on one run, **40 ms** on the
+next and **6 ms** on the one after — it is a uniform draw across the poll
+interval, not a constant, so any single measurement would have been the wrong
+number. All three are the honest price of never losing a message.
+
+### Four boundaries, four different costs
+
+| Boundary | How the trace crosses | What it took to build |
+| --- | --- | --- |
+| HTTP in | the `traceparent` header | one middleware |
+| gRPC to `presenced` | call metadata | one dial option on each side |
+| NATS | message headers | a 15-line carrier, and `Publish` → `PublishMsg` |
+| **the outbox** | **a `jsonb` column** | **a migration, and a span whose parent has already ended** |
+
+The last row is the one worth understanding. Every other boundary already had
+somewhere to put a trace context. A database row has nowhere: it waits in
+Postgres until a relay — possibly on another node — comes for it, long after the
+request that wrote it answered `201`.
+
+So the carrier is stored in `outbox.trace_context`, read back by the relay, and
+used to start a span whose parent finished 92 ms ago. That is legal, because a
+span context is an **id**, not a live object — and it is exactly what makes the
+gap above appear on one picture instead of as two unrelated traces.
+
+The column is nullable and that is the ordinary case, not an edge case: rows
+written before this stage, rows written with tracing off, rows that were not
+sampled. All of them still publish. A relay that needed a trace to deliver would
+have turned an observability feature into a delivery bug.
+
+### The circuit breaker, drawn
+
+Kill `presenced` and ask for presence six times. The spans:
+
+| | Duration | On the span |
+| --- | --- | --- |
+| Calls 1–5 | **1,000,000 µs** | `presence.answered=false` — nobody replied |
+| Call 6 | **6 µs** | a `short_circuited` event; no packet left the node |
+
+This is the Stage 6 bug made impossible to hide. That bug booked "nobody
+answered" as "the service answered", so the breaker never opened and every
+request paid the full second. It survived every unit test — they all ran against
+a server that answered — and it is invisible in a log. On a waterfall, 6 µs and
+1 s are not confusable.
+
+### What tracing costs, and what it must never cost
+
+Telemetry is the one part of a system that must never take the system down.
+
+Killed the collector mid-run: sends stayed at **8–17 ms**, the same as a healthy
+one, and the nodes wrote `traces export: processor export timeout` and carried
+on. Started it again and traces resumed **with no restart**. Spans are batched
+in memory and dropped when the queue fills, which is the correct behaviour for
+evidence about the last few minutes — Postgres is the record.
+
+With no `OTEL_EXPORTER_OTLP_ENDPOINT` the whole thing is a no-op provider that
+allocates nothing. That is what `make run` and every test use, so there is one
+code path rather than a traced one and an untraced one that drift apart.
+
+### What is deliberately not traced
+
+- **`/ws`.** A handshake becomes a connection that lives for hours, so its span
+  would never end, never export, and never be freed — 5000 of them at the Stage
+  1 load-test size. The delivery it would have shown is traced on the other side
+  anyway, as `fanout.deliver`.
+- **`/metrics`, `/livez`, `/readyz`.** Scraped every few seconds by machines.
+- **The presence heartbeat.** Two nodes beating every ten seconds is 12 root
+  traces a minute, forever. A sampler drops them; `presence.Online` — the call a
+  user actually waits for — stays.
+- **Individual database queries.** `otelgorm` would triple the span count while
+  the thing being investigated is the gap *between* processes.
+
+### Grafana
+
+`http://localhost:3000`, in the same profile, over the Prometheus that has been
+here since Stage 2. Both datasources and the dashboard are provisioned from
+files in this repo, for the same reason `prometheus.yml` is: a dashboard typed
+into a UI is gone the first time somebody runs `docker compose down -v`.
+
+Metrics say *something is slow*. A trace says *which step*. Having both, joined
+by `trace_id` on every log line, is the point of the stage.
+
 ## Shutdown
 
 `SIGINT` or `SIGTERM` starts an orderly stop, and the order matters:
@@ -1527,7 +1652,10 @@ Everything else is optional and has a working default:
 | `OUTBOX_POLL_INTERVAL` | `100ms` | how long the relay waits when the queue is empty. This is the delivery latency the outbox costs |
 | `OUTBOX_RETENTION` | `1h` | how long a published outbox row is kept before it is deleted |
 | `INBOX_RETENTION` | `48h` | how long `consumed_messages` remembers a handled message. Must stay above the stream's own 24h retention, or a redelivery could be counted twice |
-| `NODE_ID` | hostname | the name this node uses in its logs, in presence, and in its fan-out consumer |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | unset | where to send traces, e.g. `http://jaeger:4317`. Unset means tracing is off and every tracer is a no-op — that is `make run` and every test. A collector that is set but unreachable is also not a failure: spans are batched and dropped |
+| `OTEL_SERVICE_NAME` | `chat-api` | the name this process wears in Jaeger. `presenced` sets its own, `presence`, and having two different names is what makes a split visible in one waterfall |
+| `OTEL_TRACES_SAMPLER_ARG` | unset | a ratio between 0 and 1. Unset records every trace, which is right on one machine and wrong in production. Heartbeats are dropped regardless |
+| `NODE_ID` | hostname | the name this node uses in its logs, in presence, in its fan-out consumer, and as `service.instance.id` on every span |
 | `TRUSTED_PROXIES` | unset | addresses or CIDRs whose `X-Forwarded-For` is believed. Unset means trust nobody |
 
 `presenced` reads its own, much shorter, set:
@@ -1539,6 +1667,7 @@ Everything else is optional and has a working default:
 | `PRESENCE_PORT` | `9090` | the gRPC port |
 | `PRESENCE_METRICS_PORT` | `9091` | a small HTTP listener for `/metrics` and `/livez` |
 | `LOG_LEVEL`, `APP_ENV`, `NODE_ID` | | the same meaning as above |
+| `OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_SERVICE_NAME` | | the same meaning as above; compose sets the service name to `presence` |
 
 `REDIS_ADDR` moved from the API node to `presenced` in Stage 6, and setting it
 on an API node now does nothing at all: that process has no Redis client left.
@@ -1790,6 +1919,18 @@ one:
 make presencecheck
 make presencecheck ARGS="-pause 50s"   # then kill and restart presenced during the pause
 ```
+
+Check that one trace id really follows one message across four processes, and
+read the relay's poll gap as a number (Jaeger is in the `observability` profile,
+so it is not started by a plain `docker compose up`):
+```bash
+make observability                  # everything, plus Jaeger, Grafana, Prometheus
+make seed ARGS="-n 3"
+make tracecheck
+make tracecheck ARGS="-pause 20s"   # then `docker compose kill jaeger` during the pause
+```
+Then open `http://localhost:16686` for the traces and `http://localhost:3000`
+for the graphs.
 
 Run the presence service on its own (it needs a Redis; `make run` needs neither):
 ```bash

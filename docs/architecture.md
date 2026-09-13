@@ -4,7 +4,7 @@ The running system, in one place: every process, the route a message takes
 through it, and what the product loses when each part dies.
 
 The other files in `docs/` are plans written *before* a stage. This one is
-written after, and it describes what is there now — stages 0 through 6.
+written after, and it describes what is there now — stages 0 through 7.
 
 ---
 
@@ -12,6 +12,11 @@ written after, and it describes what is there now — stages 0 through 6.
 
 Seven processes. One entry point, two API nodes that run the same image, and
 three things they share.
+
+Three more — Jaeger, Grafana and Prometheus — are in the `observability` compose
+profile and are left out of this picture on purpose: nothing in the system asks
+them anything, and a node does not notice when they are gone. They watch. See
+[Path 4](#path-4--one-messages-trace).
 
 ```mermaid
 flowchart LR
@@ -167,6 +172,61 @@ twice.
 
 ---
 
+## Path 4 — one message's trace
+
+The same journey as Path 1, seen from above. Path 1 says what happens; this says
+how the *evidence* of it stays joined together while it crosses four processes.
+
+```mermaid
+flowchart LR
+    subgraph n1["api1"]
+        http["POST /conversations/:id/messages<br/>7ms"]
+        relay["outbox.publish<br/>2ms"]
+    end
+
+    pg[("outbox row<br/>payload + trace_context")]
+    nats["NATS<br/>traceparent in headers"]
+
+    subgraph n2["api2"]
+        fan["fanout.deliver<br/>112µs"]
+    end
+
+    jaeger["Jaeger :16686"]
+
+    http -->|"one transaction"| pg
+    pg -.->|"6–92ms later<br/>THE POLL GAP"| relay
+    relay --> nats
+    nats --> fan
+
+    http -.->|spans| jaeger
+    relay -.->|spans| jaeger
+    fan -.->|spans| jaeger
+```
+
+The dotted line from the row to the relay is the whole stage. Everywhere else a
+trace context rides in something that already exists — an HTTP header, gRPC
+metadata, a NATS header. A database row has none, so it is stored in a column
+and read back later, and the span it starts is a **child of a span that ended
+92 milliseconds ago**. That is legal: a span context is an id, not a live
+object. It is also what draws the gap to scale instead of leaving two unrelated
+traces for a person to guess about.
+
+| Boundary | Carrier | Cost to build |
+| --- | --- | --- |
+| HTTP in | `traceparent` header | one middleware |
+| gRPC to `presenced` | call metadata | one dial option per side |
+| NATS | message headers | a small carrier adapter |
+| **the outbox** | **`trace_context jsonb`** | **a migration and a re-parented span** |
+
+The column is nullable and most rows in a plain `make run` have nothing in it.
+Every one of them still publishes: a relay that needed a trace to deliver would
+have turned an observability feature into a delivery bug.
+
+`make tracecheck` proves the whole path by asking Jaeger, rather than by
+believing a log.
+
+---
+
 ## When one part stops
 
 Every row here was tested by killing the container on purpose. The rule the
@@ -181,6 +241,7 @@ never take the node **out**.
 | NATS | Login, history, sending. A send still answers `201` in about **10 ms**, the same as a healthy one. | Live push between nodes, and unread counts. Rows queue in `message_outbox` and go out when NATS returns. Nothing is lost, only late. |
 | `presenced` | Everything except one endpoint. Nothing on the write or delivery path knows this service exists. | `GET /conversations/:id/presence` answers `503`. After five failed calls the breaker opens and that `503` costs **5 ms** instead of **1 s**. |
 | Redis | The same as the row above — `presenced` is its only client. | Presence. `presenced` stays up and answers `Unavailable` honestly, and its gRPC health turns `NOT_SERVING`. |
+| `jaeger` | Everything. Sends stay at **8–17 ms**, the same as a healthy run, and the nodes log `traces export: processor export timeout` and carry on. Start it again and traces resume with **no restart**. | Only the traces, and only the ones exported while it was gone. Telemetry is the one thing that must never take the system down. |
 
 Three things the Stage 6 outage run taught that are easy to miss:
 
@@ -215,6 +276,9 @@ machine already holds the normal one.
 | NATS | 8222 (8222) | The monitoring page. Try `/jsz?streams=1`. |
 | Redis | 6379 (6380) | One sorted set, `chat:presence`. No volume: everything in it is stale within 30 seconds. |
 | `web` | 5173 | The dev client, and the only browser origin CORS and the WebSocket handshake accept. |
+| `jaeger` | 16686, 4317 | Traces. 16686 is the UI, 4317 is where the services export. Only in the `observability` profile, and its store is in memory — a restart loses every trace, which costs nothing, because Postgres is the record and a trace is evidence about the last few minutes. |
+| `grafana` | 3000 | Graphs over Prometheus, with Jaeger as a second datasource. Also `observability` only. |
+| `prometheus` | 9090 | The metrics from Stage 2. Also `observability` only. |
 
 ---
 
@@ -230,10 +294,15 @@ machine already holds the normal one.
 | Presence: store, gRPC service, client, breaker | [`internal/presence`](../internal/presence) |
 | The presence contract | [`proto/presence/v1`](../proto/presence/v1) |
 | Prometheus metrics | [`internal/metrics`](../internal/metrics) |
+| Tracing: setup, sampler, the outbox carrier | [`internal/tracing`](../internal/tracing) |
 | The presence service binary | [`cmd/presenced`](../cmd/presenced) |
-| Proof tools, one per stage | [`cmd/splitcheck`](../cmd/splitcheck), [`cmd/gapcheck`](../cmd/gapcheck), [`cmd/outboxcheck`](../cmd/outboxcheck), [`cmd/presencecheck`](../cmd/presencecheck) |
+| Proof tools, one per stage | [`cmd/splitcheck`](../cmd/splitcheck), [`cmd/gapcheck`](../cmd/gapcheck), [`cmd/outboxcheck`](../cmd/outboxcheck), [`cmd/presencecheck`](../cmd/presencecheck), [`cmd/tracecheck`](../cmd/tracecheck) |
 
 Every number on this page came from a real run: `docker compose up`, then the
-matching check tool with the dependency killed during the pause. The longer
-write-ups are in the [README](../README.md); the stage-by-stage plan is in
-[ROADMAP.md](../ROADMAP.md).
+matching check tool with the dependency killed during the pause. Since Stage 7
+the timings in Path 4 come from Jaeger rather than from a stopwatch around the
+whole thing, which is how "the relay poll costs about 100 ms" became "it cost
+92 ms on that message, 40 ms on the next and 6 ms on the one after".
+
+The longer write-ups are in the [README](../README.md); the stage-by-stage plan
+is in [ROADMAP.md](../ROADMAP.md).

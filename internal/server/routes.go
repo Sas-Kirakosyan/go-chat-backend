@@ -47,10 +47,11 @@ func (s *Server) RegisterRoutes() *gin.Engine {
 	// The order is the order a request passes through them, and it is chosen:
 	//
 	//  1. observeRequests  outermost, so even a refused request is counted
-	//  2. requestID        everything after this can log with the id
-	//  3. requestLogger    its work happens on the way OUT, so it sees the
+	//  2. tracing          before requestID, so the id can log the trace id
+	//  3. requestID        everything after this can log with the id
+	//  4. requestLogger    its work happens on the way OUT, so it sees the
 	//                      status recovery set
-	//  4. recovery         nearest the handlers, which is where panics come from
+	//  5. recovery         nearest the handlers, which is where panics come from
 	r := gin.New()
 
 	// Whose X-Forwarded-For do we believe?
@@ -70,6 +71,7 @@ func (s *Server) RegisterRoutes() *gin.Engine {
 	}
 
 	r.Use(observeRequests())
+	r.Use(traceRequests())
 	r.Use(s.requestID())
 	r.Use(s.requestLogger())
 	r.Use(s.recovery())

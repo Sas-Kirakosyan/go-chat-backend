@@ -304,6 +304,13 @@ why splitting too early hurts. That lesson is worth as much as the code.
 
 ## Stage 7 — Tracing across services
 
+**Status:** done. The setup, sampler and carrier are in
+[`internal/tracing`](internal/tracing), the trace crosses the outbox in the
+`trace_context` column from
+[`00006_outbox_trace.sql`](internal/database/migrations/00006_outbox_trace.sql),
+and the proof tool is [`cmd/tracecheck`](cmd/tracecheck). Jaeger and Grafana are
+in the `observability` compose profile. Measured numbers are in the README.
+
 OpenTelemetry, so one trace id follows a single message the whole way:
 
 HTTP request → outbox → broker → consumer → WebSocket push.
@@ -313,7 +320,48 @@ now two services and a slow presence call has to be found by reading two logs
 side by side; gRPC already carries metadata across the boundary, so the trace id
 has somewhere to ride.
 
-Jaeger for traces, Grafana for the Prometheus metrics from Stage 2.
+The four boundaries cost four different amounts, and that is the most useful
+thing in the stage:
+
+| Boundary | How the trace crosses | Work |
+| --- | --- | --- |
+| HTTP in | `traceparent` header | one middleware |
+| gRPC to `presenced` | call metadata | one dial option per side |
+| The broker | NATS headers | a 15-line carrier, and `Publish` → `PublishMsg` |
+| **The outbox** | **a jsonb column** | **a migration, a model field, and a span whose parent has already ended** |
+
+The outbox is the interesting one. Every other boundary already had a place to
+put a trace context. A database row does not: it waits in Postgres until a relay
+on some other node comes for it, long after the request that wrote it answered
+`201`. So the carrier is stored, read back, and used to start a span whose
+parent is a span that finished 92 ms ago — which is legal, because a span
+context is an id and not a live object, and is exactly what makes Jaeger draw
+the poll delay to scale.
+
+**What the build taught that the plan did not say:**
+
+- **A root sampler only ever sees the OUTERMOST span.** The plan dropped
+  heartbeat traces by matching the gRPC method name, `presence.v1.PresenceService/Heartbeat`.
+  It did nothing, and only a real run showed it: the presence client wraps every
+  call in its own span, so *that* span starts the trace and is the only name the
+  sampler is asked about. The gRPC span is a child, and `ParentBased` keeps it
+  whatever the rule says. Dropping a child cannot undo a root. Every unit test
+  passed, because they all asserted the rule and never asked which span was
+  first.
+- **The 100 ms was really 6–92 ms, and it moves.** Stage 5 estimated the relay
+  poll at "up to 100 ms". Traced, one message waited **92 ms** and the next
+  **40 ms**, and a third **6 ms** — a uniform draw across the poll interval, not
+  a constant, so any single measurement would have been the wrong number. This
+  is the difference between a graph and a guess.
+- **The trace is what makes the Stage 6 bug impossible to hide.** With
+  `presenced` killed, five calls draw as **1,000,000 µs** spans with
+  `presence.answered=false`, and the sixth as a **6 µs** span carrying a
+  `short_circuited` event. The old bug — booking a failure as an answer — was
+  invisible in tests and in logs. It is not invisible on a waterfall.
+- **A tracing error handler is worth its five lines.** With Jaeger killed the
+  nodes wrote `traces export: processor export timeout` and carried on; sends
+  stayed at **8–17 ms**. Without the handler that failure is silent, and
+  "tracing stopped working" becomes an afternoon.
 
 **Learn:** finding a slow step when the work crosses four processes.
 
@@ -367,6 +415,6 @@ worked on one.
 - [x] Stage 4 — Delivery guarantees
 - [x] Stage 5 — Outbox and a broker
 - [x] Stage 6 — A second service over gRPC
-- [ ] Stage 7 — Tracing
+- [x] Stage 7 — Tracing
 - [ ] Stage 8 — Data scale, load and chaos tests
 - [ ] Stage 9 — Kubernetes and CI

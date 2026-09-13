@@ -8,8 +8,12 @@ import (
 	"time"
 
 	"github.com/nats-io/nats.go/jetstream"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 
 	"go-chat-backend/internal/event"
+	"go-chat-backend/internal/tracing"
 )
 
 // DeliverFunc pushes one event to the sockets of the listed users on THIS
@@ -68,13 +72,44 @@ func (b *Broker) SubscribeFanout(ctx context.Context, deliver DeliverFunc) {
 	}
 
 	sub, err := cons.Consume(func(msg jetstream.Msg) {
+		// The trace continues here, on a node that is usually not the one that
+		// published. This span is the last hop anybody can see: the browser is
+		// not instrumented, so "delivered" means the frame was handed to this
+		// node's hub.
+		//
+		// The context is discarded rather than kept: deliver hands the event to
+		// the hub, which writes to sockets on its own goroutines and outlives
+		// this call. Passing a context that ends here into work that does not
+		// would be worse than passing none.
+		_, span := tracing.Tracer().Start(
+			extractTrace(ctx, msg.Headers()),
+			"fanout.deliver",
+			trace.WithSpanKind(trace.SpanKindConsumer),
+		)
+		defer span.End()
+
 		var env envelope
 		if err := json.Unmarshal(msg.Data(), &env); err != nil {
 			// Nothing to retry: the bytes will not improve. Acks are off on
 			// this consumer anyway, so it is dropped either way.
+			span.RecordError(err)
+			span.SetStatus(codes.Error, "decode envelope")
 			slog.Error("fan-out could not decode envelope", "err", err)
 			return
 		}
+
+		span.SetAttributes(
+			attribute.Int64("message.id", int64(env.Event.MessageID)),
+			attribute.Int64("conversation.id", int64(env.Event.ConversationID)),
+			attribute.Int64("message.seq", int64(env.Event.Seq)),
+			// Who published against who is delivering. When these differ the
+			// trace is proving the thing Stage 3 existed for: a message that
+			// crossed nodes.
+			attribute.String("message.published_by", env.From),
+			attribute.String("message.delivered_by", b.nodeID),
+			attribute.Int("message.recipients", len(env.UserIDs)),
+		)
+
 		b.fanoutRecv.Add(1)
 		deliver(env.Event, env.UserIDs)
 	})
@@ -154,6 +189,20 @@ func (b *Broker) ConsumeUnread(ctx context.Context, apply ApplyFunc) {
 // handleUnread processes one message. It is separate from ConsumeUnread only
 // so the retry and dead-letter rules can be read in one screen.
 func (b *Broker) handleUnread(ctx context.Context, msg jetstream.Msg, apply ApplyFunc) {
+	// A child of the publish, like fan-out — but this one is worth reading even
+	// when nothing goes wrong, because it is the only place a redelivery is
+	// visible. A message handed out twice draws TWO spans on one trace, and a
+	// message that gives up draws a red one. Stage 5 could only see that by
+	// reading num_redelivered on the NATS monitoring page and guessing which
+	// message it meant.
+	ctx, span := tracing.Tracer().Start(
+		extractTrace(ctx, msg.Headers()),
+		"unread.apply",
+		trace.WithSpanKind(trace.SpanKindConsumer),
+		trace.WithAttributes(attribute.String("messaging.consumer.group", unreadDurable)),
+	)
+	defer span.End()
+
 	meta, err := msg.Metadata()
 	if err != nil {
 		// Not a JetStream message, which should be impossible on this
@@ -162,8 +211,13 @@ func (b *Broker) handleUnread(ctx context.Context, msg jetstream.Msg, apply Appl
 		_ = msg.Term()
 		return
 	}
+	span.SetAttributes(attribute.Int64("messaging.nats.delivered", int64(meta.NumDelivered)))
 	if meta.NumDelivered > 1 {
 		b.redelivered.Add(1)
+		// An event, not just the number. On a trace this is what turns "the
+		// unread count was late" into "it was late because the first attempt
+		// timed out and JetStream waited AckWait before trying again".
+		span.AddEvent("redelivered")
 	}
 
 	var env envelope
@@ -182,11 +236,19 @@ func (b *Broker) handleUnread(ctx context.Context, msg jetstream.Msg, apply Appl
 	work, cancel := context.WithTimeout(ctx, ackWait/2)
 	defer cancel()
 
+	span.SetAttributes(
+		attribute.Int64("message.id", int64(env.Event.MessageID)),
+		attribute.Int64("conversation.id", int64(env.Event.ConversationID)),
+	)
+
 	if err := apply(work, env.Event); err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "apply unread")
 		if meta.NumDelivered >= maxDeliver {
 			b.deadLetter(ctx, msg, meta, err.Error())
 			return
 		}
+		span.AddEvent("nak")
 		slog.Warn("unread work failed, will retry",
 			"message_id", env.Event.MessageID,
 			"delivered", meta.NumDelivered,
@@ -218,6 +280,17 @@ func (b *Broker) handleUnread(ctx context.Context, msg jetstream.Msg, apply Appl
 // on the next try the copy may work. A message that is stuck is better than a
 // message that is silently gone.
 func (b *Broker) deadLetter(ctx context.Context, msg jetstream.Msg, meta *jetstream.MsgMetadata, reason string) {
+	// The span belongs to the caller's unread.apply, which is exactly right:
+	// the dead-lettering is the end of that attempt, not a step of its own. The
+	// reason travels with it, so the trace answers "why did this message stop"
+	// without anyone opening the DLQ.
+	span := trace.SpanFromContext(ctx)
+	span.AddEvent("dead_letter", trace.WithAttributes(
+		attribute.String("reason", reason),
+		attribute.String("messaging.destination", deadSubject),
+	))
+	span.SetStatus(codes.Error, "dead lettered: "+reason)
+
 	dead := struct {
 		Reason    string          `json:"reason"`
 		Delivered uint64          `json:"delivered"`

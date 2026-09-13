@@ -20,6 +20,7 @@ import (
 	"go-chat-backend/internal/metrics"
 	"go-chat-backend/internal/outbox"
 	"go-chat-backend/internal/presence"
+	"go-chat-backend/internal/tracing"
 	"go-chat-backend/internal/ws"
 )
 
@@ -94,6 +95,10 @@ type App struct {
 	// handing it over.
 	stopBackground context.CancelFunc
 	background     sync.WaitGroup
+
+	// traceShutdown flushes whatever spans have not reached the collector yet.
+	// It is never nil: with tracing off it is a function that does nothing.
+	traceShutdown tracing.Shutdown
 }
 
 // New builds the app: logging, config, database, migrations, metrics, routes,
@@ -109,6 +114,15 @@ func New() *App {
 	// the same setup and two services whose logs are formatted differently are
 	// two services you cannot read together.
 	log := logging.Setup()
+
+	// Tracing, if there is a collector to send to. It goes here, before
+	// anything else can want to start a span, for the same reason logging does:
+	// a package that reads the global provider before it is installed keeps the
+	// no-op it found and never traces anything, which is a silent failure.
+	//
+	// Unset OTEL_EXPORTER_OTLP_ENDPOINT is single-node development and costs
+	// nothing — see internal/tracing.
+	traceShutdown := tracing.Setup(context.Background(), serviceName())
 
 	port, err := strconv.Atoi(os.Getenv("PORT"))
 	if err != nil || port <= 0 {
@@ -223,7 +237,11 @@ func New() *App {
 		ErrorLog: slog.NewLogLogger(log.Handler(), slog.LevelWarn),
 	}
 
-	app := &App{HTTP: httpServer, srv: s, hub: hub, db: db, presence: presenceClient, broker: nats, relay: relay}
+	app := &App{
+		HTTP: httpServer, srv: s, hub: hub, db: db,
+		presence: presenceClient, broker: nats, relay: relay,
+		traceShutdown: traceShutdown,
+	}
 	app.startBackground()
 	return app
 }
@@ -371,7 +389,25 @@ func (a *App) Shutdown(ctx context.Context) error {
 	presenceErr := a.presence.Close()
 	dbErr := a.db.Close()
 
+	// Tracing goes LAST, after everything it was watching.
+	//
+	// Spans are batched, so at any moment a couple of seconds of them are still
+	// in memory. Flushing earlier would export what had happened so far and
+	// then drop every span from the shutdown itself — which is exactly the part
+	// of a rolling deploy anybody would want to look at.
+	//
+	// Its own short deadline, taken from the caller's if that is shorter. A
+	// collector that is down must not hold a process that is trying to exit;
+	// losing the last batch of telemetry is not worth one extra second of a
+	// deploy.
+	var traceErr error
+	if a.traceShutdown != nil {
+		traceCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+		traceErr = a.traceShutdown(traceCtx)
+		cancel()
+	}
+
 	// errors.Join keeps every problem instead of hiding some, and returns nil
 	// when they are all nil.
-	return errors.Join(httpErr, brokerErr, presenceErr, dbErr)
+	return errors.Join(httpErr, brokerErr, presenceErr, dbErr, traceErr)
 }

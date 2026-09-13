@@ -8,9 +8,23 @@ import (
 	"gorm.io/gorm"
 
 	"go-chat-backend/internal/event"
+	"go-chat-backend/internal/tracing"
 )
 
 //this file content (database) talk to Postgres
+
+// jsonOrNil turns the bytes of a trace carrier into what the column wants.
+//
+// The column is nullable jsonb, so "no trace" has to be a real NULL and not an
+// empty string — an empty string is not valid JSON and Postgres would reject
+// the insert, failing a send because tracing was off.
+func jsonOrNil(b []byte) *string {
+	if len(b) == 0 {
+		return nil
+	}
+	s := string(b)
+	return &s
+}
 
 // CreateConversation makes a room and puts the creator inside it, together
 // with everyone in memberIDs. It returns ErrUserNotFound if any of those ids
@@ -229,7 +243,21 @@ func (s *service) CreateMessage(ctx context.Context, conversationID, senderID ui
 			return err
 		}
 
-		row := &Outbox{Topic: event.TopicMessageCreated, Payload: payload}
+		// The trace context of the request doing the sending, stored beside the
+		// payload.
+		//
+		// This is the one boundary in the system with nowhere else to put it.
+		// The relay reads this row later — after the 201, on a poll tick, maybe
+		// on another node — so without these bytes the trace would end here and
+		// start again there, as two unrelated traces of one message.
+		//
+		// It is nil whenever there is no span, which is every test and every
+		// `make run`. That writes NULL and changes nothing else.
+		row := &Outbox{
+			Topic:        event.TopicMessageCreated,
+			Payload:      payload,
+			TraceContext: jsonOrNil(tracing.InjectCarrier(ctx)),
+		}
 		if err := tx.Create(row).Error; err != nil {
 			return fmt.Errorf("insert outbox row: %w", err)
 		}

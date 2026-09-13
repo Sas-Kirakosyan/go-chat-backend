@@ -115,6 +115,38 @@ outboxcheck:
 presencecheck:
 	@go run ./cmd/presencecheck $(ARGS)
 
+# Stage 7: prove that ONE trace id follows one message across every process it
+# touches — the HTTP request, the outbox row in Postgres, the relay, NATS, and
+# the fan-out on the OTHER node.
+#
+# It invents a traceparent, sends with it, then asks Jaeger what is in that
+# trace and prints the spans as a waterfall. Two things to read: the PASS line
+# needs at least two processes in one trace, and the OFFSET column shows the
+# gap between the 201 and the publish — that gap is the relay's poll interval,
+# the number Stage 5 estimated and never measured.
+#
+# Jaeger is in the observability profile, so it is not started by a plain
+# `docker compose up`:
+#
+#   docker compose --profile observability up --build -d
+#   make seed ARGS="-n 3"
+#   make tracecheck
+#
+# The run that matters: kill the collector and confirm it costs nothing.
+#
+#   make tracecheck ARGS="-pause 20s"
+#   docker compose kill jaeger        # during the pause
+tracecheck:
+	@go run ./cmd/tracecheck $(ARGS)
+
+# Everything, with the graphs and the traces:
+#
+#   http://localhost:16686   Jaeger, the traces
+#   http://localhost:3000    Grafana, over the Prometheus from Stage 2
+#   http://localhost:9090    Prometheus itself
+observability:
+	@docker compose --profile observability up --build -d
+
 # Migrations. The server applies them itself on startup; these are for looking
 # before you leap, and for stepping back after a mistake.
 migrate-status:
@@ -257,6 +289,7 @@ watch:
 	}"
 
 .PHONY: all build run presenced web seed wsload splitcheck gapcheck outboxcheck presencecheck \
+	tracecheck observability \
 	clean watch docker-run docker-down proto proto-breaking \
 	test test-v test-one test-race itest cover \
 	migrate-status migrate-up migrate-down migration

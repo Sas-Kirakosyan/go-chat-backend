@@ -1,0 +1,41 @@
+# Grafana's datasources, as a file rather than as clicks.
+#
+# This is committed for the same reason prometheus.yml is: a datasource added
+# through the UI lives in one Docker volume, and it is gone the first time
+# somebody runs `docker compose down -v`. A file is also something you can read
+# in a diff, which a click is not.
+#
+# The part worth reading is tracesToLogs' neighbour below — the link from a
+# Prometheus graph to a Jaeger trace. Metrics say something got slow. Traces say
+# which step. Joining them is the whole reason both are here.
+
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    # The compose service name on the shared network, not localhost: inside a
+    # container localhost is Grafana itself.
+    url: http://prometheus:9090
+    isDefault: true
+    jsonData:
+      # Grafana's own scrape assumption. It must match prometheus.yml, or the
+      # graphs draw gaps between real data points.
+      timeInterval: 5s
+      # Exemplars: a metric sample that carries the trace id of one request
+      # that produced it. Clicking it opens that exact trace in Jaeger.
+      #
+      # Nothing in this repo emits exemplars yet — that needs the metrics to be
+      # recorded through the OpenTelemetry metrics API rather than the
+      # Prometheus client, which Stage 7 deliberately did not do. The link is
+      # configured now so that the day they exist, it already works.
+      exemplarTraceIdDestinations:
+        - name: trace_id
+          datasourceUid: jaeger
+
+  - name: Jaeger
+    type: jaeger
+    uid: jaeger
+    access: proxy
+    url: http://jaeger:16686

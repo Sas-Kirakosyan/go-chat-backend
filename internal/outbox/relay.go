@@ -301,22 +301,30 @@ func (r *Relay) Drain(ctx context.Context) (Batch, error) {
 			continue
 		}
 
+		// The trace picks up again here, as a child of the request that wrote
+		// the row — a request that finished long ago. See startPublishSpan.
+		rowCtx, span := startPublishSpan(ctx, row, ev)
+
 		// Who is in the room is read now, after the commit, not at write time.
 		// So somebody added to the room a second ago receives this message,
 		// and a frozen list stored in the payload would have missed them.
-		memberIDs, err := r.store.ListConversationMemberIDs(ctx, ev.ConversationID)
+		memberIDs, err := r.store.ListConversationMemberIDs(rowCtx, ev.ConversationID)
 		if err != nil {
+			endSpanErr(span, err)
 			r.note(ctx, row.ID, "list members: "+err.Error())
 			break
 		}
 
-		if err := r.pub.Publish(ctx, row.ID, ev, memberIDs); err != nil {
+		if err := r.pub.Publish(rowCtx, row.ID, ev, memberIDs); err != nil {
+			endSpanErr(span, err)
 			r.failed.Add(1)
 			r.note(ctx, row.ID, err.Error())
 			r.log.Warn("could not publish an outbox row, will retry",
 				"outbox_id", row.ID, "attempts", row.Attempts+1, "err", err)
 			break
 		}
+
+		endSpanOK(span, len(memberIDs))
 		done = append(done, row.ID)
 	}
 

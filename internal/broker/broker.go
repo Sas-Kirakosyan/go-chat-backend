@@ -279,10 +279,20 @@ func (b *Broker) Publish(ctx context.Context, outboxID uint64, ev event.MessageC
 	ctx, cancel := context.WithTimeout(ctx, publishTimeout)
 	defer cancel()
 
+	// PublishMsg rather than Publish, because a *nats.Msg is the only shape
+	// with somewhere to put headers — and the headers are how the trace crosses
+	// the broker. The relay's span is the parent; every consumer that picks
+	// this message up becomes its child, on whatever node happens to get it.
+	msg := &nats.Msg{
+		Subject: messageSubject(ev.ConversationID),
+		Data:    data,
+	}
+	injectTrace(ctx, msg)
+
 	// Publish and wait for the ack, not PublishAsync. The relay must know the
 	// broker really has the message before it stamps the outbox row, because
 	// the stamp is what makes the row unreadable forever.
-	_, err = b.js.Publish(ctx, messageSubject(ev.ConversationID), data, jetstream.WithMsgID(msgID(outboxID)))
+	_, err = b.js.PublishMsg(ctx, msg, jetstream.WithMsgID(msgID(outboxID)))
 	if err != nil {
 		b.publishFails.Add(1)
 		return fmt.Errorf("publish to nats: %w", err)
